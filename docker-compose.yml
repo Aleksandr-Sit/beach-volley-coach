@@ -1,0 +1,9 @@
+services:
+  coach:
+    build: .
+    container_name: beach-volley-coach
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    # Бот работает в режиме long-polling — порты наружу не нужны.
