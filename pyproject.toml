@@ -1,0 +1,31 @@
+[project]
+name = "beach-volley-coach"
+version = "1.0.0"
+description = "Telegram AI-тренер с приоритетом пляжного волейбола"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 95
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes (неиспользуемые импорты/переменные)
+    "I",        # isort (порядок импортов)
+    "B",        # flake8-bugbear (частые ловушки)
+    "UP",       # pyupgrade
+    "C4",       # comprehensions
+    "SIM",      # упрощения
+]
+ignore = [
+    "E501",     # длину строк держим line-length, но не падаем на комментариях
+    "B008",     # вызовы в аргументах по умолчанию — норм для DI aiogram
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # assert в тестах — это норма
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

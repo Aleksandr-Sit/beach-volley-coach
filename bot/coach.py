@@ -73,12 +73,34 @@ def estimate_food(llm: LLMClient, text: str) -> dict:
         return {"kcal": 0.0, "protein": 0.0}
 
 
+def profile_digest(profile: dict) -> str:
+    """Минимальная выжимка профиля для LLM.
+
+    Приватность: наружу уходит только то, без чего совет невозможен. Раньше
+    отправлялся ВЕСЬ профиль (вес, показатели, полная история травм), а на
+    бесплатном тарифе данные могут использоваться для обучения модели.
+    """
+    if not profile:
+        return "мужчина, любитель пляжного волейбола"
+    injuries = ", ".join(
+        i.get("area", "") for i in profile.get("injuries", [])
+        if i.get("severity") in ("главный лимит", "мониторинг")
+    )
+    parts = [
+        f"{profile.get('age', '')} лет, мужчина" if profile.get("age") else "мужчина",
+        f"спорт: {profile.get('sport', 'пляжный волейбол')} ({profile.get('vb_level', '')})",
+        f"цель: {profile.get('goals', '')}",
+    ]
+    if injuries:
+        parts.append(f"ограничения: {injuries}")
+    return "; ".join(p for p in parts if p.strip(" ;:"))
+
+
 def advise(llm: LLMClient, db: DB, text: str) -> str:
     """Свободный совет тренера (питание/восстановление/вопрос), с учётом профиля."""
-    profile = db.get_profile() or {}
     user = (
-        f"Профиль атлета (JSON): {profile}\n\n"
-        f"Вопрос/сообщение: {text}\n\n"
+        f"Атлет: {profile_digest(db.get_profile() or {})}\n\n"
+        f"Вопрос: {text}\n\n"
         "Ответь как тренер: коротко, по делу, с кратким 'почему'."
     )
     # Может вернуть "" при недоступности LLM — вызывающий обработает фолбэком.

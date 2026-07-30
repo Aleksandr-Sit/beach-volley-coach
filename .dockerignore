@@ -1,0 +1,19 @@
+# Секреты и данные НЕ должны попадать в слои образа.
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Мусор сборки
+.git/
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+backup.sh

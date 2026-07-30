@@ -25,21 +25,34 @@ def monday_of(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
+def backfill_generated_weeks(db: DB) -> None:
+    """Разовая миграция: помечает уже развёрнутые недели, чтобы не дублировать их
+    после перехода на явный реестр generated_weeks."""
+    for d in db.template_session_dates():
+        try:
+            db.mark_week_generated(monday_of(date.fromisoformat(d)).isoformat())
+        except ValueError:
+            continue
+
+
 def generate_week(db: DB, any_day: date) -> None:
     """Создаёт сессии недели из шаблона волейбола + дефолтный зал.
 
-    Идемпотентно: если на неделю уже есть сессии — не дублирует.
+    Идемпотентно по реестру generated_weeks. Раньше признаком было «есть хоть одна
+    сессия в неделе» — из-за этого перенос сессии на будущую неделю блокировал
+    генерацию её плана целиком.
     """
     monday = monday_of(any_day)
-    sunday = monday + timedelta(days=6)
-    if db.week_has_sessions(monday.isoformat(), sunday.isoformat()):
+    if db.is_week_generated(monday.isoformat()):
         return
+    db.mark_week_generated(monday.isoformat())  # до вставок — защита от гонки
 
     template = db.get_template()
     vb_days = set()
     for t in template:
         d = (monday + timedelta(days=int(t["weekday"]))).isoformat()
         vb_days.add(int(t["weekday"]))
+        load = "heavy" if t["kind"] == "game" else "moderate"
         db.add_session(
             date=d,
             start_time=None,  # плавающее время, уточняется
@@ -47,10 +60,11 @@ def generate_week(db: DB, any_day: date) -> None:
             title=t["title"],
             kind=t["kind"],
             duration_min=t["duration_min"],
-            load="heavy" if t["kind"] == "game" else "moderate",
+            load=load,
+            base_load=load,
+            time_hint=t["time_hint"],
             status="planned",
             origin="template",
-            notes=f"подсказка времени: {t['time_hint']}",
         )
 
     # Зал/восстановление — только на дни без волейбола (правило коллизии).
@@ -60,20 +74,32 @@ def generate_week(db: DB, any_day: date) -> None:
         d = (monday + timedelta(days=weekday)).isoformat()
         db.add_session(
             date=d, start_time=None, category=category, title=title,
-            kind=kind, duration_min=dur, load=load, status="planned",
-            origin="template", notes="автопрегуляция по check-in",
+            kind=kind, duration_min=dur, load=load, base_load=load,
+            status="planned", origin="template",
         )
 
     autoregulate_week(db, monday)
 
 
-def autoregulate_week(db: DB, monday: date) -> list[str]:
-    """Проверяет инварианты и мягко чинит зал. Возвращает список пояснений.
+_LOAD_ORDER = ["light", "moderate", "heavy"]
 
-    MVP-логика:
-      - тяжёлые ноги (gym/lower/heavy) не ближе 48ч ДО игровой -> понижаем нагрузку;
-      - если check-in дня 'tired' -> зал этого дня понижается.
-    Более глубокую периодизацию подключим в gym_plan/weekly-adapt.
+
+def _lower(load: str, steps: int = 1) -> str:
+    """Понизить нагрузку на N ступеней (не ниже light)."""
+    i = _LOAD_ORDER.index(load) if load in _LOAD_ORDER else 1
+    return _LOAD_ORDER[max(0, i - steps)]
+
+
+def autoregulate_week(db: DB, monday: date) -> list[str]:
+    """Пересчитывает нагрузку зала ОТ ИСХОДНОЙ (base_load) по правилам.
+
+    Полный пересчёт, а не одностороннее понижение: если причина ушла (отдохнул,
+    игру отменили) — нагрузка ВОЗВРАЩАЕТСЯ к исходной. Раньше был «храповик»:
+    один раз понизив, обратно уже не поднимали.
+
+    Правила:
+      - тяжёлые ноги не в день игры и не накануне -> на ступень ниже;
+      - check-in дня 'tired' -> зал/восстановление этого дня в light.
     """
     sunday = monday + timedelta(days=6)
     sessions = db.sessions_between(monday.isoformat(), sunday.isoformat())
@@ -81,31 +107,34 @@ def autoregulate_week(db: DB, monday: date) -> list[str]:
 
     game_dates = {
         date.fromisoformat(s["date"]) for s in sessions
-        if s["category"] == "vb" and s["kind"] == "game"
+        if s["category"] == "vb" and s["kind"] == "game" and s["status"] != "cancelled"
     }
 
     for s in sessions:
-        if s["category"] != "gym" or s["kind"] != "lower":
-            continue
-        sd = date.fromisoformat(s["date"])
-        # Тяжёлые ноги нельзя в день игры или накануне (<=1 дня до игровой).
-        too_close = any(0 <= (g - sd).days <= 1 for g in game_dates)
-        if too_close and s["load"] == "heavy":
-            db.update_session(s["id"], load="moderate",
-                              notes="понижено: менее 48ч до игры")
-            notes.append(
-                f"{WEEKDAY_RU[sd.weekday()]}: тяжёлые ноги близко к игре → облегчил."
-            )
-
-    # Учёт самочувствия: tired -> лёгкий день.
-    for s in sessions:
         if s["category"] not in ("gym", "recovery"):
             continue
+        sd = date.fromisoformat(s["date"])
+        base = s["base_load"] or s["load"] or "moderate"
+        target = base
+        reason = ""
+
+        # 1) тяжёлые ноги близко к игре
+        if (s["category"] == "gym" and s["kind"] == "lower" and base == "heavy"
+                and any(0 <= (g - sd).days <= 1 for g in game_dates)):
+            target = _lower(target)
+            reason = "близко к игре"
+
+        # 2) самочувствие «устал» в этот день
         ci = db.latest_checkin(s["date"])
-        if ci and ci["readiness"] == "tired" and s["load"] != "light":
-            db.update_session(s["id"], load="light", notes="понижено: устал (check-in)")
-            notes.append(
-                f"{WEEKDAY_RU[date.fromisoformat(s['date']).weekday()]}: "
-                f"устал → зал облегчил."
-            )
+        if ci and ci["readiness"] == "tired":
+            target = "light"
+            reason = "устал (check-in)"
+
+        if target != s["load"]:
+            db.update_session(s["id"], load=target)
+            day = WEEKDAY_RU[sd.weekday()]
+            if _LOAD_ORDER.index(target) < _LOAD_ORDER.index(s["load"] or "moderate"):
+                notes.append(f"{day}: {s['title']} → облегчил ({reason}).")
+            else:
+                notes.append(f"{day}: {s['title']} → вернул исходную нагрузку.")
     return notes

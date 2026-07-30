@@ -7,25 +7,39 @@ from html import escape
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from ..coach import advise, estimate_food, parse_edit
+from ..clock import today as _today
+from ..coach import advise, parse_edit
 from ..content.exercises import match_exercise, normalize_log
 from ..content.glossary import lookup as glossary_lookup
 from ..content.workout import build_workout
 from ..db import DB
-from ..nutrition.foods import estimate_meal, parse_manual, parse_product
-from ..nutrition.targets import compute_targets
 from ..intent import parse_local, parse_time_and_duration
 from ..llm.client import LLMClient
+from ..modules.weekly_adapt import is_deload_week
 from ..mutations import (
-    add_session, cancel_session, confirm_all, date_for_weekday, format_result,
-    move_session, restore_session, retime_session,
+    add_session,
+    cancel_session,
+    confirm_all,
+    date_for_weekday,
+    format_result,
+    move_session,
+    restore_session,
+    retime_session,
 )
+from ..states import Flow
 from ..ui import (
-    ADD_TYPES, Cb, add_day_kb, add_type_kb, back_kb, confirm_kb, day_keyboard,
-    glossary_kb, nutrition_kb, render_day, render_nutrition, session_menu_kb,
+    ADD_TYPES,
+    Cb,
+    add_day_kb,
+    add_type_kb,
+    back_kb,
+    confirm_kb,
+    day_keyboard,
+    glossary_kb,
+    render_day,
+    session_menu_kb,
     weekday_kb,
 )
 
@@ -34,6 +48,21 @@ router = Router()
 _HOWTO_MARK = ("как ", "что такое", "что за", "объясни", "покажи", "техник",
                "упражнен", "делать")
 _EDIT_MARK = ("отмен", "перенес", "перенос", "дожд", "добав", "сдвин", "подвин")
+
+
+_EDIT_HINTS = ("отмен", "перенес", "перенос", "сдвин", "подвин", "дожд", "добав",
+               "поставь", "запиш", "не буд", "не пойд", "пропущ", "заболел",
+               "болею", "отдыха", "завтра", "сегодня", "послезавтра",
+               "понедельник", "вторник", "сред", "четверг", "пятниц", "суббот",
+               "воскресен", "тренировк", "игр", "зал")
+
+
+def _looks_like_edit(text: str) -> bool:
+    """Стоит ли тратить вызов LLM на разбор правки расписания."""
+    t = text.lower()
+    has_hint = any(w in t for w in _EDIT_HINTS)
+    has_time = bool(re.search(r"\d{1,2}\s*[:.;]\s*\d{2}|\bв\s*\d{1,2}\b", t))
+    return has_hint or has_time
 
 
 def _is_howto(text: str) -> bool:
@@ -48,20 +77,12 @@ def _is_howto(text: str) -> bool:
 async def show_day(target: Message, db: DB) -> None:
     """Показать (вернуть) план на сегодня с основной клавиатурой — чтобы не терялся.
     Показывает и отменённые сегодня сессии с кнопкой «Вернуть»."""
-    today = date.today()
+    today = _today()
     sessions = db.sessions_for(today.isoformat())
     cancelled = db.cancelled_for(today.isoformat())
     await target.answer(render_day(today, sessions, cancelled),
                         reply_markup=day_keyboard(today, sessions, cancelled))
 
-
-class Flow(StatesGroup):
-    wait_retime = State()   # ждём время «сегодня»
-    wait_moveday_time = State()  # ждём время для переноса на день
-    confirm_edit = State()  # ждём подтверждения свободной правки
-    wait_add_time = State()  # ждём время для добавляемой тренировки
-    wait_log = State()  # ждём текст результата тренировки (веса/повторы)
-    wait_food = State()  # ждём описание приёма пищи
 
 
 # ---------- check-in ----------
@@ -104,7 +125,8 @@ async def on_menu(cq: CallbackQuery, callback_data: Cb, db: DB) -> None:
 
 def _workout_text(db: DB, s) -> str:
     last = db.last_workout_log(s["category"], s["kind"] or "")
-    return build_workout(s, last_log=last, weights=db.get_weights())
+    return build_workout(s, last_log=last, weights=db.get_weights(),
+                         deload=is_deload_week(db))
 
 
 @router.callback_query(Cb.filter(F.a == "today_btn"))
@@ -126,7 +148,7 @@ async def on_workout(cq: CallbackQuery, callback_data: Cb, db: DB) -> None:
 @router.callback_query(Cb.filter(F.a == "wtoday"))
 async def on_wtoday(cq: CallbackQuery, callback_data: Cb, db: DB) -> None:
     await cq.answer()
-    sessions = db.sessions_for(date.today().isoformat())
+    sessions = db.sessions_for(_today().isoformat())
     if not sessions:
         await cq.message.answer("Сегодня тренировок нет.")
         return
@@ -231,7 +253,7 @@ async def on_moveday(cq: CallbackQuery, callback_data: Cb) -> None:
 @router.callback_query(Cb.filter(F.a == "setday"))
 async def on_setday(cq: CallbackQuery, callback_data: Cb, state: FSMContext) -> None:
     v = callback_data.v
-    target = date.today().isoformat() if v == "t" else date_for_weekday(int(v))
+    target = _today().isoformat() if v == "t" else date_for_weekday(int(v))
     await state.update_data(sid=callback_data.sid, target_date=target)
     await state.set_state(Flow.wait_moveday_time)
     await cq.answer()
@@ -264,96 +286,6 @@ async def got_moveday_time(msg: Message, state: FSMContext, db: DB) -> None:
     await show_day(msg, db)
 
 
-# ---------- питание ----------
-def nutrition_view(db: DB):
-    """Возвращает (текст, клавиатура) экрана питания со счётчиком доз добавок."""
-    profile = db.get_profile() or {}
-    targets = compute_targets(profile)
-    today = date.today()
-    foods = db.food_for(today.isoformat())
-    supps = profile.get("supplements") or []
-    counts = db.supplement_counts(today.isoformat())
-    text = render_nutrition(today, targets, foods, supps,
-                            profile.get("supplement_gap"), counts)
-    return text, nutrition_kb(supps, counts)
-
-
-@router.callback_query(Cb.filter(F.a == "food_add"))
-async def on_food_add(cq: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(Flow.wait_food)
-    await cq.answer()
-    await cq.message.answer(
-        "Что съел? Напиши приём, например:\n"
-        "«овсянка 60, банан, 3 яйца» или «обед: рис 200, индейка 150».\n"
-        "Блюдо из кафе — можно указать калории из меню: "
-        "«панкейки 240г 500 ккал» (и «25 белка», если знаешь).\n\n"
-        "<i>Вес: <b>мясо — сырое</b> (как на упаковке), гарнир — <b>готовый</b> "
-        "(на тарелке), овсянка — <b>сухая</b> крупа.</i>"
-    )
-
-
-@router.message(Flow.wait_food)
-async def got_food(msg: Message, state: FSMContext, db: DB, llm: LLMClient) -> None:
-    await state.clear()
-    text = msg.text.strip()
-    k, p, matched = estimate_meal(text, extra=db.get_custom_foods())
-    manual_k, manual_p = parse_manual(text)
-    src = "staples" if matched else None
-    # Ручные числа ДОБАВЛЯЮТСЯ к распознанному из базы (для блюда в общем списке).
-    if manual_k is not None:
-        k += manual_k
-        src = "manual"
-    if manual_p is not None:
-        p += manual_p
-    # Ничего не распознали и чисел нет → оценка через ИИ.
-    if manual_k is None and not matched:
-        est = estimate_food(llm, text)
-        k, p = est["kcal"], est["protein"]
-        src = "llm" if (k or p) else None
-    db.add_food(date.today().isoformat(), text, k, p)
-    note = {"manual": " <i>(вкл. твои числа)</i>", "llm": " <i>(оценка ИИ)</i>"}
-    if src in note:
-        extra = note[src]
-    elif src is None:
-        extra = " <i>(не распознал — укажи ккал: «… 500 ккал» или состав)</i>"
-    else:
-        extra = ""
-    await msg.answer(f"🍽 <b>Добавил:</b> {escape(text)} — "
-                     f"≈{round(k)} ккал, {round(p)} г белка{extra}")
-    txt, kb = nutrition_view(db)
-    await msg.answer(txt, reply_markup=kb)
-
-
-@router.callback_query(Cb.filter(F.a == "food_undo"))
-async def on_food_undo(cq: CallbackQuery, db: DB) -> None:
-    ok = db.delete_last_food(date.today().isoformat())
-    await cq.answer("Убрал" if ok else "Нечего убирать")
-    txt, kb = nutrition_view(db)
-    await cq.message.answer(txt, reply_markup=kb)
-
-
-@router.callback_query(Cb.filter(F.a == "supp"))
-async def on_supp(cq: CallbackQuery, callback_data: Cb, db: DB) -> None:
-    supps = (db.get_profile() or {}).get("supplements") or []
-    try:
-        s = supps[int(callback_data.v)]
-    except (ValueError, IndexError, TypeError):
-        await cq.answer("Не найдено", show_alert=True)
-        return
-    name = s.get("name", "")
-    target = max(1, int(s.get("doses", 1)))
-    today = date.today().isoformat()
-    c = db.supplement_counts(today).get(name, 0)
-    if c < target:
-        db.take_supplement(today, name)
-        await cq.answer(f"{name}: {c + 1}/{target}")
-    else:
-        db.clear_supplement(today, name)  # сброс на максимуме — для правок
-        await cq.answer(f"{name}: сброс")
-    txt, kb = nutrition_view(db)
-    await cq.message.answer(txt, reply_markup=kb)
-
-
 # ---------- добавить тренировку (выбор типа → день → время) ----------
 @router.callback_query(Cb.filter(F.a == "add"))
 async def on_add(cq: CallbackQuery) -> None:
@@ -374,7 +306,7 @@ async def on_addtype(cq: CallbackQuery, callback_data: Cb, state: FSMContext) ->
 @router.callback_query(Cb.filter(F.a == "addday"))
 async def on_addday(cq: CallbackQuery, callback_data: Cb, state: FSMContext) -> None:
     v = callback_data.v
-    target = date.today().isoformat() if v == "t" else date_for_weekday(int(v))
+    target = _today().isoformat() if v == "t" else date_for_weekday(int(v))
     await state.update_data(add_date=target)
     await state.set_state(Flow.wait_add_time)
     await cq.answer()
@@ -458,27 +390,15 @@ def _apply_intent(db: DB, intent: dict):
 # Свободный текст (не в FSM): сначала детерминированный разбор, затем LLM, затем совет.
 @router.message(F.text & ~F.text.startswith("/"))
 async def free_text(msg: Message, state: FSMContext, db: DB, llm: LLMClient) -> None:
-    today = date.today()
-    # 0) Добавление своего продукта в базу питания.
-    if re.search(r"добав\w*\s+продукт|^\s*продукт[:\s]", msg.text, re.IGNORECASE):
-        prod = parse_product(msg.text)
-        if prod:
-            db.add_custom_food(*prod)
-            name, _bg, kcal, prot, ftype = prod
-            unit = "шт" if ftype == "count" else "100 г"
-            await msg.answer(f"✅ Добавил продукт <b>«{escape(name)}»</b>: "
-                             f"{kcal:g} ккал, {prot:g} г белка на {unit}.\n"
-                             "<i>Теперь пиши его в приёмах — посчитаю по твоим числам.</i>")
-        else:
-            await msg.answer("Формат: <b>добавь продукт: рис бурый 130 3</b> "
-                             "(ккал и белок на 100 г). Для штучного добавь «шт».")
-        return
-
+    today = _today()
     # 1) Быстрый детерминированный разбор частых правок — без LLM, без квоты.
     intent = parse_local(db, today, msg.text)
-    # 2) Фолбэк на LLM для нестандартных формулировок.
-    if intent is None:
+    # 2) Фолбэк на LLM — только если текст ВООБЩЕ похож на правку расписания.
+    #    Раньше модель звалась на каждое сообщение (плюс ещё раз в advise) и
+    #    вдвое быстрее выжигала бесплатную квоту.
+    if intent is None and _looks_like_edit(msg.text):
         intent = parse_edit(llm, db, today, msg.text) or {}
+    intent = intent or {}
 
     if intent.get("action") in ("cancel", "move", "retime", "add"):
         await state.update_data(intent=intent)

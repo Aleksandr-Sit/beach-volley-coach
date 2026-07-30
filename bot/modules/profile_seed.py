@@ -54,6 +54,10 @@ VB_TEMPLATE = [
 
 
 def seed_if_empty(db: DB) -> None:
+    # Разовая миграция реестра сгенерированных недель (см. generate_week).
+    from .schedule_sync import backfill_generated_weeks
+    backfill_generated_weeks(db)
+
     prof = db.get_profile()
     if prof is None:
         db.set_profile(PROFILE)

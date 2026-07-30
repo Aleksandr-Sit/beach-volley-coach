@@ -1,0 +1,4 @@
+# Скрипты для Linux — всегда LF, иначе на сервере "bad interpreter".
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf

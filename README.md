@@ -1,76 +1,105 @@
-# Beach Volley Coach 🏐
+# 🏐 Beach Volley Coach
 
-![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
-![aiogram](https://img.shields.io/badge/aiogram-3-2CA5E0?logo=telegram&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![SQLite](https://img.shields.io/badge/SQLite-state-003B57?logo=sqlite&logoColor=white)
-![LLM](https://img.shields.io/badge/LLM-pluggable-8A2BE2)
+**Telegram-бот — персональный тренер с приоритетом пляжного волейбола.** Ведёт
+расписание, силовую программу с авто-прогрессией, питание и восстановление;
+адаптирует план под реальную жизнь: погоду, переносы, самочувствие и травмы.
 
-Personal AI training coach in Telegram, built around **beach volleyball as the top
-priority** — gym, nutrition and recovery are auto-scheduled around it. Morning push
-with the day's plan, edits straight from the chat (buttons or free text), automatic
-weekly recalculation.
+Работает в проде 24/7 на VPS, используется автором ежедневно.
 
-> ⚠️ The athlete profile in this repo (`docs/profile.md`, `bot/modules/profile_seed.py`)
-> is a **generic sample** for demonstration. Put your own data in there before first run.
+![CI](https://github.com/Aleksandr-Sit/beach-volley-coach/actions/workflows/ci.yml/badge.svg)
 
-## ✨ Highlights
-- **Priority-driven scheduler** — a rule engine keeps volleyball first: heavy legs never
-  land on a game day or the day before; a "tired" check-in automatically lightens the gym.
-- **Edit-from-chat flow** — buttons *and* free text; a deterministic intent parser
-  (`bot/intent.py`) handles the common edits at zero LLM cost, LLM only as fallback.
-- **Pluggable LLM brain** — everything sits behind `bot/llm/client.py`; switching from
-  free Gemini to paid Claude/OpenAI is one branch in `build_llm()`, no bot-code changes.
-- **Deterministic content** — exercises, progression, nutrition targets (Mifflin×1.75)
-  computed in code, not by the LLM — cheap, stable, testable.
-- **Adaptive week** — Sunday review (plan vs actual) auto-adjusts next week's working
-  weights and accessory variation.
+---
 
-## How it works
-```mermaid
-flowchart TD
-    A["APScheduler<br/>morning push 08:00"] --> B["Day plan + check-in<br/>(fresh / ok / tired)"]
-    B --> C{"Edit?"}
-    C -->|button / free text| D["intent.py — deterministic parse<br/>(LLM fallback via client.py)"]
-    D --> E["confirm → mutation → recompute WEEK"]
-    E --> F["SQLite (source of truth)<br/>+ events audit"]
-    G["Sunday review<br/>plan vs actual"] --> H["weekly-adapt:<br/>+weight / accessory variation"]
+## Зачем это
+
+Волейбол — приоритет, всё остальное его обслуживает. Готовые фитнес-приложения
+этого не умеют: они не знают, что тренировку отменили из-за дождя, что тяжёлые
+ноги нельзя ставить накануне игры и что плечо — лимитирующий фактор.
+Бот строит план вокруг этих ограничений и пересчитывает его при каждой правке.
+
+## Что умеет
+
+| Модуль | Функции |
+|---|---|
+| 🗓 **Расписание** | Утренний пуш с планом дня, отмена/возврат/перенос/добавление сессий, правки свободным текстом («дождь, отменили», «перенеси на завтра», «в 18:30») |
+| 🏋️ **Тренировки** | Конкретные упражнения под профиль (плечо-safe верх, prehab голеностопа), глоссарий с объяснениями + видео, лог результатов |
+| 📈 **Прогрессия** | Авто-рост рабочих весов по фактическим записям, вариативность подсобки, разгрузочная неделя каждые 5 недель |
+| 🍽 **Питание** | Цели по калориям/белку от фактического веса, лог еды текстом, база продуктов по этикеткам, трекинг добавок по дозам |
+| ⚖️ **Вес тела** | Замеры, тренд за месяц, автоподстройка целей питания |
+| 📊 **Недельный разбор** | Факт vs план, решение по прогрессии, рекомендации; приходит сам в воскресенье |
+| 🩺 **Здоровье** | Плановые напоминания: годовой чек анализов, сезонный витамин D |
+
+## Инженерные решения
+
+**Детерминированное ядро, LLM — фолбэк.** Разбор правок, расчёт питания,
+объяснение упражнений и прогрессия работают на обычном коде, без обращений к
+модели. LLM подключается только для нестандартных формулировок. Это даёт
+предсказуемость, нулевую стоимость и работоспособность при исчерпанной квоте
+бесплатного тарифа — проверено в бою.
+
+**LLM за интерфейсом.** `LLMClient` абстрагирует провайдера: смена Gemini на
+Anthropic/OpenAI — одна ветка в фабрике, код бота не меняется. Ошибки модели
+(429, сеть) не пробрасываются наверх — бот деградирует мягко.
+
+**SQLite как единственный источник правды** + версионные миграции через
+`PRAGMA user_version`. Все модули читают состояние из БД, обработчики его
+мутируют, автопрегуляция пересчитывает неделю после каждой правки.
+
+**Идемпотентность там, где это критично.** Прогрессия применяется ровно один
+раз за неделю, генерация недели отслеживается реестром, чек-ин — один на день.
+Каждое из этих правил появилось после реального бага (см. `tests/`).
+
+**Минимизация данных.** В LLM уходит выжимка профиля, а не медицинская карта.
+
+## Стек
+
+Python 3.11 · aiogram 3 · SQLite · APScheduler · Docker · Gemini API (free tier)
+
+## Архитектура
+
+```
+bot/
+├── main.py            # сборка бота, роутеров, планировщика (78 строк)
+├── clock.py           # единый tz-aware «сегодня» (пояс атлета, не сервера)
+├── config.py          # конфиг из .env
+├── db.py              # SQLite: схема, миграции, доступ к данным
+├── views.py           # сборка экранов (текст + клавиатура)
+├── scheduler.py       # плановые задачи
+├── states.py          # FSM-состояния
+├── ui.py              # рендер и клавиатуры
+├── mutations.py       # мутации плана + пересчёт недели
+├── intent.py          # детерминированный разбор правок и времени
+├── coach.py           # промпты и работа с LLM
+├── handlers/          # commands · nutrition · schedule
+├── modules/           # schedule_sync · weekly_adapt · profile_seed
+├── content/           # workout · glossary · exercises · texts
+├── nutrition/         # targets · foods
+└── llm/               # client (интерфейс) · gemini
+tests/                 # 57 тестов чистой логики
 ```
 
-## Stack
-Python 3.11 · **aiogram 3** (long-polling) · **APScheduler** · **SQLite** ·
-pluggable LLM (Google Gemini free tier by default) · **Docker Compose** · deployed on a VPS.
+## Запуск
 
-## Modules
-- `handlers/` · `mutations.py` · `intent.py` — chat flow, edits, deterministic parsing
-- `modules/schedule_sync.py` · `weekly_adapt.py` — week generation & adaptive progression
-- `content/` — workouts, exercises, glossary (prehab-aware)
-- `nutrition/` — calorie/macro targets, food base, logging
-- `llm/` — provider-agnostic client (`gemini.py` + swap point)
-
-## Setup (keys — all free tier)
-1. **Bot token:** message [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token.
-2. **Gemini key (free):** https://aistudio.google.com/app/apikey → create a key.
-3. Copy `.env.example` → `.env`, fill `TELEGRAM_BOT_TOKEN` and `GEMINI_API_KEY`.
-4. Start the bot, send `/start` — it replies with your `chat_id`. Put it in `.env` as
-   `TELEGRAM_CHAT_ID` and restart (needed for the morning push).
-
-## Run locally
 ```bash
-python -m venv .venv
-.venv/Scripts/python -m pip install -r requirements.txt   # Windows
-# source .venv/bin/activate && pip install -r requirements.txt   # Linux/macOS
-cp .env.example .env    # then fill in .env
-python -m bot.main
+cp .env.example .env          # токен бота (@BotFather) + ключ Gemini
+docker compose up -d --build
 ```
 
-## Deploy (Docker)
+Разработка:
 ```bash
-cp .env.example .env && nano .env     # fill tokens
-docker compose up --build -d          # rebuild after any .py change
-docker compose logs -f coach
+pip install -r requirements.txt && pip install pytest ruff
+ruff check bot/ tests/
+pytest -q
 ```
 
-## Swapping the LLM later
-Logic is hidden behind `bot/llm/client.py` (`LLMClient`). To move to Claude/OpenAI:
-add an implementation next to `gemini.py` and one branch in `build_llm()` — bot code unchanged.
+## Тесты
+
+57 тестов покрывают то, что ломалось в реальной эксплуатации: детектор боли
+(подстрока «бол» ловила «Болгарский сплит-присед» и блокировала прогрессию),
+идемпотентность недельного разбора, генерацию недели при переносе сессии,
+разбор питания без запятых, форматы времени и веса.
+
+---
+
+> Личный проект. Профиль атлета в публичной версии — пример; реальные данные
+> в репозиторий не попадают.

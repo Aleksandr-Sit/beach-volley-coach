@@ -4,6 +4,9 @@ services:
     container_name: beach-volley-coach
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Контейнер по умолчанию в UTC — из-за этого даты «съезжали» ночью.
+      TZ: ${TIMEZONE:-Europe/Samara}
     volumes:
       - ./data:/app/data
     # Бот работает в режиме long-polling — порты наружу не нужны.

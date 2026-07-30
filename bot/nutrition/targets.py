@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 
-def compute_targets(profile: dict | None) -> dict:
+def compute_targets(profile: dict | None, weight_kg: float | None = None) -> dict:
+    """weight_kg — фактический замер (если есть), иначе значение из профиля."""
     p = profile or {}
-    weight = float(p.get("weight_kg", 82))
+    weight = float(weight_kg if weight_kg else p.get("weight_kg", 82))
     height = float(p.get("height_cm", 188))
-    age = int(p.get("age", 40))
+    age = int(p.get("age", 30))
     goal = (p.get("nutrition_goal") or "").lower()
 
     # Mifflin-St Jeor (мужчина) + активность. Высокий NEAT + спорт → ~1.75.

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+from .clock import today as _today
 from .db import DB
 from .modules.schedule_sync import WEEKDAY_RU, autoregulate_week, monday_of
 
@@ -45,7 +46,7 @@ def retime_session(db: DB, sid: int, new_time: str) -> tuple[str, list[str]]:
 def date_for_weekday(target_weekday: int, ref: date | None = None) -> str:
     """Дата указанного дня недели. Если он уже прошёл ИЛИ это сегодня — берём
     следующую неделю (перенос «на день» подразумевает другой день, не сегодня)."""
-    ref = ref or date.today()
+    ref = ref or _today()
     target = monday_of(ref) + timedelta(days=target_weekday)
     if target <= ref:
         target += timedelta(days=7)

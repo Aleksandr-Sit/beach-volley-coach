@@ -17,9 +17,11 @@ FOODS: list[tuple[str, list[str], int, int, float, str]] = [
     ("Творог 9%", ["творог", "творож"], 150, 218, 19.5, "weight"),
     ("Греческий йогурт", ["греческ", "греч йогурт", "греческий йогурт"], 150, 100, 12.0, "weight"),
     # Кофе — ДО «Молоко», иначе «кофе с молоком» посчитается как стакан молока.
-    ("Капучино/латте", ["капучино", "латте", "раф", "cappuccino", "latte", "флэт", "flat"], 250, 90, 4.5, "count"),
-    ("Американо", ["американо", "эспрессо", "espresso", "черный кофе"], 200, 5, 0.3, "count"),
-    ("Кофе с молоком", ["кофе"], 200, 45, 2.0, "count"),
+    ("Капучино/латте", ["кофе капучино", "кофе латте", "кофе раф", "капучино", "латте",
+                        "раф", "cappuccino", "latte", "флэт", "flat"], 250, 90, 4.5, "count"),
+    ("Американо", ["кофе американо", "кофе эспрессо", "черный кофе", "американо",
+                   "эспрессо", "espresso"], 200, 5, 0.3, "count"),
+    ("Кофе с молоком", ["кофе с молоком", "кофе"], 200, 45, 2.0, "count"),
     ("Молоко", ["молок"], 200, 120, 6.0, "weight"),
     ("Йогурт", ["йогурт"], 150, 90, 7.0, "weight"),
     ("Яйцо", ["яйц", "яиц"], 55, 80, 7.0, "count"),
@@ -64,39 +66,67 @@ def parse_product(text: str) -> tuple[str, int, float, float, str] | None:
 
 
 def estimate_meal(text: str, extra: list[tuple] | None = None) -> tuple[int, int, list[str]]:
-    """Грубо оценивает (ккал, белок, список продуктов). Разбирает по сегментам
-    (запятая/точка с запятой/«и»), число ищет в пределах своего сегмента.
-    extra — свои продукты (проверяются ПЕРЕД встроенной базой)."""
+    """Оценивает (ккал, белок, список продуктов). Находит ВСЕ продукты в тексте
+    (не только через запятую) и привязывает к каждому ближайшее число — работает
+    и для «рис 200 индейка 150», и для «3 яйца», и для повторов. extra — свои
+    продукты (приоритетнее встроенной базы)."""
     t = text.lower().replace("ё", "е")
-    t = re.sub(r"(\d),(\d)", r"\1.\2", t)  # десятичная запятая 0,5 -> 0.5 (до сплита)
-    segments = re.split(r"\s*[,;]\s*|\s+и\s+", t)
-    total_k = 0.0
-    total_p = 0.0
-    matched: list[str] = []
+    t = re.sub(r"(\d),(\d)", r"\1.\2", t)  # десятичная запятая 0,5 -> 0.5
     catalog = (extra or []) + FOODS
-    for seg in segments:
-        for name, keys, base_g, kcal, prot, typ in catalog:
-            if not any(k.replace("ё", "е") in seg for k in keys):
-                continue
-            qm = re.search(r"(\d+(?:[.,]\d+)?)\s*(г|гр|шт|мл)?", seg)
-            if qm:
-                qty = float(qm.group(1).replace(",", "."))
-                unit = qm.group(2)
-            elif re.search(r"половин|\bпол[\s-]|полбанан|пол[- ]?яблок", seg):
-                qty, unit = 0.5, None  # «полбанана», «половина», «пол яблока»
-            else:
-                qty, unit = None, None
-            if typ == "count":
-                n = qty if (qty and qty <= 20 and unit in (None, "шт")) else 1.0
-                k_add, p_add = kcal * n, prot * n
-            else:  # weight
-                if qty and (unit in ("г", "гр", "мл") or qty >= 30):
-                    factor = qty / base_g
-                else:
-                    factor = 1.0
-                k_add, p_add = kcal * factor, prot * factor
-            total_k += k_add
-            total_p += p_add
-            matched.append(name)
-            break  # один продукт на сегмент
+
+    # 1) все вхождения продуктов (позиция, конец, продукт)
+    cands = []
+    for food in catalog:
+        for k in food[1]:
+            kk = k.lower().replace("ё", "е")
+            start = 0
+            while (p := t.find(kk, start)) != -1:
+                cands.append((p, p + len(kk), food))
+                start = p + len(kk)
+    if not cands:
+        return 0, 0, []
+    # предпочесть более длинное совпадение при пересечении (греческий йогурт > йогурт)
+    cands.sort(key=lambda c: (c[0], -(c[1] - c[0])))
+    anchors: list[tuple] = []
+    for p, e, food in cands:
+        if all(e <= a[0] or p >= a[1] for a in anchors):
+            anchors.append((p, e, food))
+    anchors.sort()
+
+    # 2) числовые токены (кроме тех, что помечают ккал/белок — это ручные макросы)
+    nums = []
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(г|гр|шт|мл)?", t):
+        tail = t[m.end(): m.end() + 6]
+        if re.match(r"\s*(ккал|kcal|кал|белк|бел\b)", tail):
+            continue
+        nums.append((m.start(), float(m.group(1)), m.group(2)))
+
+    # 3) каждое число → ближайший продукт (одно число на продукт)
+    qty_of: dict[int, tuple] = {}
+    for npos, val, unit in nums:
+        best, best_d = None, 1e9
+        for i, (ap, ae, _f) in enumerate(anchors):
+            d = 0 if ap <= npos <= ae else min(abs(npos - ap), abs(npos - ae))
+            if d < best_d:
+                best_d, best = d, i
+        if best is not None and best not in qty_of:
+            qty_of[best] = (val, unit)
+
+    total_k = total_p = 0.0
+    matched: list[str] = []
+    for i, (ap, ae, food) in enumerate(anchors):
+        name, _keys, base_g, kcal, prot, typ = food
+        qty, unit = qty_of.get(i, (None, None))
+        if qty is None and re.search(r"половин|\bпол[\s-]|полбанан|пол[- ]?яблок",
+                                     t[max(0, ap - 8):ae + 2]):
+            qty = 0.5  # «полбанана», «половина»
+        if typ == "count":
+            n = qty if (qty and qty <= 20 and unit in (None, "шт")) else 1.0
+            total_k += kcal * n
+            total_p += prot * n
+        else:  # weight
+            factor = qty / base_g if (qty and (unit in ("г", "гр", "мл") or qty >= 30)) else 1.0
+            total_k += kcal * factor
+            total_p += prot * factor
+        matched.append(name)
     return round(total_k), round(total_p), matched

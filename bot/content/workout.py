@@ -1,12 +1,12 @@
 """Наполнение тренировок: конкретные упражнения под профиль атлета.
 
 Детерминированные данные (0 токенов на рендер). Приоритет — пляжный волейбол:
-зал дополняющий, submaximal, плечо-safe (правое плечо — главный лимит),
+зал дополняющий, submaximal, плечо-safe (плечо — лимитирующий фактор),
 автопрегуляция по нагрузке сессии (heavy/moderate/light).
 
-Профиль-константы (пример): присед база 100 (5×5, не предел), трап-гриф 120
-(не предел), жимы — плечо-дружественно, голеностоп/колено — мониторим,
-поясница — кор защищает.
+Рабочие веса берутся из БД (прогрессия), а не хардкодятся. Жимы штанги над
+головой избегаем при чувствительном плече; голеностоп и VMO — мониторим;
+поясницу защищает кор.
 """
 from __future__ import annotations
 
@@ -36,8 +36,8 @@ def _lower(load: str, weights: dict, var: int) -> list[tuple[str, list[str]]]:
             "Кор антиротация (паллоф) — 2×30с/сторону",
         ] + ANKLE_PREHAB)]
     heavy = load == "heavy"
-    sq = f"{weights.get('squat', 100):g}"
-    tb = f"{weights.get('trapbar', 120):g}"
+    sq = f"{weights.get('squat', 95):g}"
+    tb = f"{weights.get('trapbar', 90):g}"
     blocks = []
     if heavy:
         blocks.append(("Прыжковый блок (низкий объём, техника приземления)", [
@@ -46,7 +46,7 @@ def _lower(load: str, weights: dict, var: int) -> list[tuple[str, list[str]]]:
         ]))
     # Вариативность подсобки по чётности недели.
     if var == 0:
-        uni = f"Болгарский сплит-присед — {'3×8' if heavy else '2×8'}/нога (контроль колена)"
+        uni = f"Болгарский сплит-присед — {'3×8' if heavy else '2×8'}/нога (акцент на VMO)"
         post = f"Румынская тяга — {'3×8' if heavy else '2×10'}"
     else:
         uni = f"Выпады с гантелями — {'3×10' if heavy else '2×10'}/нога (колено не заваливать)"
@@ -122,7 +122,7 @@ def _volleyball(kind: str) -> list[tuple[str, list[str]]]:
     if kind == "game":
         blocks.append(("Перед игрой", [
             "Несколько подводящих прыжков нарастающе (не с максимума сразу).",
-            "Береги правое плечо: первые удары — вполсилы, разогреться.",
+            "Береги плечо: первые удары — вполсилы, разогреться.",
         ]))
     blocks.append(("После тренировки", [
         "Заминка + лёгкая растяжка плеча и бедра 3–5 мин.",
@@ -142,7 +142,23 @@ def _week_var(date_iso: str) -> int:
         return 0
 
 
-def build_workout(session, last_log=None, weights: dict | None = None) -> str:
+def _deload_blocks(load: str, weights: dict) -> list[tuple[str, list[str]]]:
+    """Разгрузочная неделя: объём вниз, веса те же, без прыжкового блока."""
+    sq = f"{weights.get('squat', 95):g}"
+    tb = f"{weights.get('trapbar', 90):g}"
+    return [
+        ("Разгрузка — работаем вполсилы", [
+            f"Присед — 3×5 @RPE6 (рабочий ~{sq} кг, легко и технично)",
+            f"Тяга трап-гриф — 2×5 (рабочий ~{tb} кг)",
+            "Без прыжкового блока и без отказа — на этой неделе восстанавливаемся",
+        ]),
+        ("Поддержка", ANKLE_PREHAB + ["Планка — 2×30с"]),
+        ("Плечо", SHOULDER_PREHAB),
+    ]
+
+
+def build_workout(session, last_log=None, weights: dict | None = None,
+                  deload: bool = False) -> str:
     """Рендерит конкретную тренировку. last_log — прошлый результат для ориентира,
     weights — текущие рабочие веса (прогрессия)."""
     category = session["category"]
@@ -152,7 +168,9 @@ def build_workout(session, last_log=None, weights: dict | None = None) -> str:
     weights = weights or {"squat": 95, "trapbar": 90}
     var = _week_var(session["date"])
 
-    if category == "gym" and kind == "lower":
+    if category == "gym" and deload:
+        blocks = _deload_blocks(load, weights)
+    elif category == "gym" and kind == "lower":
         blocks = _lower(load, weights, var)
     elif category == "gym":  # upper или добавленный «Зал» — верх плечо-safe
         blocks = _upper(load, var)

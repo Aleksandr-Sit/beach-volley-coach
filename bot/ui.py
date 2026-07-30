@@ -28,10 +28,10 @@ def _full_date(d: date) -> str:
 def _time_sub(sess) -> str:
     if sess["start_time"]:
         return f"🕐 {sess['start_time']}"
-    notes = sess["notes"] or ""
-    if "утро" in notes:
+    hint = (sess["time_hint"] or "") if "time_hint" in sess else ""
+    if "утро" in hint:
         return "🕐 утром"
-    if "вечер" in notes:
+    if "вечер" in hint:
         return "🕐 вечером"
     return "🕐 время уточнить"
 
@@ -138,12 +138,21 @@ def _bar(cur: float, target: float, width: int = 10) -> str:
 
 def render_nutrition(d: date, targets: dict, foods: list,
                      supplements: list | None = None, gap: str | None = None,
-                     counts: dict | None = None) -> str:
+                     counts: dict | None = None,
+                     weight: tuple | None = None, trend: float | None = None) -> str:
     counts = counts or {}
     eaten_k = sum((f["kcal"] or 0) for f in foods)
     eaten_p = sum((f["protein"] or 0) for f in foods)
     lines = [f"🍽 <b>Питание</b> · <i>{_full_date(d)}</i>",
              f"<i>режим: {targets['mode']}</i>", DIVIDER]
+    if weight:
+        w_date, w_kg = weight
+        trend_s = ""
+        if trend is not None:
+            arrow = "↗️" if trend > 0 else ("↘️" if trend < 0 else "→")
+            trend_s = f" · {arrow} {trend:+g} кг за месяц"
+        lines.append(f"⚖️ <b>{w_kg:g} кг</b> <i>({w_date}){trend_s}</i>")
+        lines.append("")
     lines.append("🎯 <b>Цель на день</b>")
     lines.append(f"   🔥 {targets['kcal']} ккал · 🥩 {targets['protein']} г белка")
     lines.append(f"   🧈 жиры {targets['fat']} г · 🍚 углеводы ~{targets['carbs']} г")
@@ -192,6 +201,7 @@ def nutrition_kb(supplements: list | None = None,
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Добавить приём", callback_data=Cb(a="food_add"))
     kb.button(text="↩️ Убрать последний", callback_data=Cb(a="food_undo"))
+    kb.button(text="⚖️ Записать вес", callback_data=Cb(a="weight_add"))
     for i, s in enumerate(supplements):
         name = s.get("name", "")
         target = max(1, int(s.get("doses", 1)))
