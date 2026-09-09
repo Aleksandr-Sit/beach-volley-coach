@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, KeyboardButton, Message, ReplyKeyboardMarkup
@@ -12,8 +14,18 @@ from aiogram.types import BotCommand, KeyboardButton, Message, ReplyKeyboardMark
 from ..clock import today
 from ..content.texts import HELP_TEXT
 from ..db import DB
+from ..llm.client import LLMClient
+from ..llm.health import check_llm
 from ..modules.weekly_adapt import run_weekly_adapt
-from ..views import day_view, nutrition_view, products_view, week_view, weight_view
+from ..views import (
+    day_view,
+    nutrition_view,
+    products_view,
+    program_view,
+    status_view,
+    week_view,
+    weight_view,
+)
 
 router = Router(name="commands")
 
@@ -29,10 +41,12 @@ PANEL = ReplyKeyboardMarkup(
 BOT_COMMANDS = [
     BotCommand(command="today", description="📋 План на сегодня"),
     BotCommand(command="week", description="🗓 Вся неделя (правка любой сессии)"),
+    BotCommand(command="program", description="🔄 Программа и сезон (сменить, править)"),
     BotCommand(command="food", description="🍽 Питание: цель, съедено, добавки"),
     BotCommand(command="weight", description="⚖️ Вес тела: записать и динамика"),
     BotCommand(command="product", description="🧾 Свои продукты (добавить/список)"),
     BotCommand(command="review", description="📊 Разбор недели и прогрессия"),
+    BotCommand(command="status", description="🩺 Самопроверка: всё ли работает"),
     BotCommand(command="help", description="❓ Что я умею"),
     BotCommand(command="start", description="🔄 Перезапуск / приветствие"),
 ]
@@ -83,6 +97,19 @@ async def review_cmd(msg: Message, db: DB) -> None:
 async def food_cmd(msg: Message, db: DB) -> None:
     text, kb = nutrition_view(db)
     await msg.answer(text, reply_markup=kb)
+
+
+@router.message(Command("program"))
+async def program_cmd(msg: Message, db: DB) -> None:
+    text, kb = program_view(db)
+    await msg.answer(text, reply_markup=kb)
+
+
+@router.message(Command("status"))
+async def status_cmd(msg: Message, db: DB, llm: LLMClient) -> None:
+    """Самопроверка. Живой вызов модели — в потоке, чтобы не вешать бот."""
+    ok, detail = await asyncio.to_thread(check_llm, llm)
+    await msg.answer(status_view(db, ok, detail))
 
 
 @router.message(Command("weight"))

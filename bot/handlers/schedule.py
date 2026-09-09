@@ -1,6 +1,7 @@
 """Обработчики расписания: check-in, edit-флоу (кнопки) и свободный текст."""
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import date
 from html import escape
@@ -17,10 +18,12 @@ from ..content.workout import build_workout
 from ..db import DB
 from ..intent import parse_local, parse_time_and_duration
 from ..llm.client import LLMClient
-from ..modules.weekly_adapt import is_deload_week
+from ..modules.program import block_index, cycle_badge, is_deload
+from ..modules.schedule_sync import monday_of
 from ..mutations import (
     add_session,
     cancel_session,
+    change_type,
     confirm_all,
     date_for_weekday,
     format_result,
@@ -31,6 +34,7 @@ from ..mutations import (
 from ..states import Flow
 from ..ui import (
     ADD_TYPES,
+    PROGRAM_TYPES,
     Cb,
     add_day_kb,
     add_type_kb,
@@ -40,7 +44,9 @@ from ..ui import (
     glossary_kb,
     render_day,
     session_menu_kb,
+    session_type_kb,
     weekday_kb,
+    workout_kb,
 )
 
 router = Router()
@@ -123,10 +129,28 @@ async def on_menu(cq: CallbackQuery, callback_data: Cb, db: DB) -> None:
                             reply_markup=session_menu_kb(callback_data.sid))
 
 
+def _variant(db: DB, s) -> int:
+    """Номер варианта подсобки: блок мезоцикла + ручной сдвиг кнопкой «другой».
+
+    Блок меняется сам каждые 4 недели — это и есть защита от заезженности.
+    Сдвиг живёт в пределах недели, чтобы замена не «прыгала» между днями.
+    """
+    d = date.fromisoformat(s["date"])
+    shift = db.variation_shift(monday_of(d).isoformat(), s["kind"] or "")
+    return block_index(db, d) + shift
+
+
 def _workout_text(db: DB, s) -> str:
+    d = date.fromisoformat(s["date"])
     last = db.last_workout_log(s["category"], s["kind"] or "")
     return build_workout(s, last_log=last, weights=db.get_weights(),
-                         deload=is_deload_week(db))
+                         deload=is_deload(db, d), variant=_variant(db, s),
+                         badge=cycle_badge(db, d))
+
+
+def _workout_kb(s):
+    """Кнопка «другой вариант» есть только там, где подсобка вообще ротируется."""
+    return workout_kb(s["id"], can_swap=s["category"] == "gym")
 
 
 @router.callback_query(Cb.filter(F.a == "today_btn"))
@@ -142,7 +166,7 @@ async def on_workout(cq: CallbackQuery, callback_data: Cb, db: DB) -> None:
     if not s:
         await cq.message.answer("Сессия не найдена — пришли /today.")
         return
-    await cq.message.answer(_workout_text(db, s), reply_markup=back_kb())
+    await cq.message.answer(_workout_text(db, s), reply_markup=_workout_kb(s))
 
 
 @router.callback_query(Cb.filter(F.a == "wtoday"))
@@ -153,8 +177,48 @@ async def on_wtoday(cq: CallbackQuery, callback_data: Cb, db: DB) -> None:
         await cq.message.answer("Сегодня тренировок нет.")
         return
     for i, s in enumerate(sessions):
-        kb = back_kb() if i == len(sessions) - 1 else None
+        kb = _workout_kb(s) if i == len(sessions) - 1 else None
         await cq.message.answer(_workout_text(db, s), reply_markup=kb)
+
+
+@router.callback_query(Cb.filter(F.a == "swap"))
+async def on_swap(cq: CallbackQuery, callback_data: Cb, db: DB) -> None:
+    """«Надоело» — сдвигает подсобку на следующий вариант в пределах недели."""
+    s = db.get_session(callback_data.sid)
+    if not s:
+        await cq.answer("Сессия не найдена", show_alert=True)
+        return
+    mon = monday_of(date.fromisoformat(s["date"]))
+    db.bump_variation(mon.isoformat(), s["kind"] or "")
+    db.log_event("variation_swapped", {"kind": s["kind"], "week": mon.isoformat()})
+    await cq.answer("Поменял подсобку")
+    await cq.message.answer(_workout_text(db, s), reply_markup=_workout_kb(s))
+
+
+@router.callback_query(Cb.filter(F.a == "stype"))
+async def on_type_menu(cq: CallbackQuery, callback_data: Cb, db: DB) -> None:
+    s = db.get_session(callback_data.sid)
+    if not s:
+        await cq.answer("Сессия не найдена", show_alert=True)
+        return
+    await cq.answer()
+    await cq.message.answer(
+        f"🔁 <b>{escape(s['title'])}</b> — на что меняем?\n"
+        "<i>Только эта тренировка. Программу недели это не тронет.</i>",
+        reply_markup=session_type_kb(callback_data.sid))
+
+
+@router.callback_query(Cb.filter(F.a == "stypeset"))
+async def on_type_set(cq: CallbackQuery, callback_data: Cb, db: DB) -> None:
+    key = callback_data.v or ""
+    if key not in PROGRAM_TYPES:
+        await cq.answer("Не понял тип", show_alert=True)
+        return
+    _label, cat, kind, title, dur, load = PROGRAM_TYPES[key]
+    msg, notes = change_type(db, callback_data.sid, cat, kind, title, dur, load)
+    await cq.answer("Поменял")
+    await cq.message.answer(format_result(msg, notes))
+    await show_day(cq.message, db)
 
 
 @router.callback_query(Cb.filter(F.a == "log"))
@@ -397,7 +461,9 @@ async def free_text(msg: Message, state: FSMContext, db: DB, llm: LLMClient) -> 
     #    Раньше модель звалась на каждое сообщение (плюс ещё раз в advise) и
     #    вдвое быстрее выжигала бесплатную квоту.
     if intent is None and _looks_like_edit(msg.text):
-        intent = parse_edit(llm, db, today, msg.text) or {}
+        # to_thread: клиент Gemini синхронный, прямой вызов из корутины вешал
+        # весь бот на время ответа модели (и на весь таймаут при её недоступности).
+        intent = await asyncio.to_thread(parse_edit, llm, db, today, msg.text) or {}
     intent = intent or {}
 
     if intent.get("action") in ("cancel", "move", "retime", "add"):
@@ -424,7 +490,7 @@ async def free_text(msg: Message, state: FSMContext, db: DB, llm: LLMClient) -> 
 
     # 3) Не правка — совет тренера (LLM), с фолбэком на видео для «как делать».
     howto = _is_howto(msg.text)
-    reply = advise(llm, db, msg.text)
+    reply = await asyncio.to_thread(advise, llm, db, msg.text)
     if reply and not reply.startswith("[LLM"):
         await msg.answer(escape(reply),
                          reply_markup=glossary_kb(msg.text) if howto else back_kb())

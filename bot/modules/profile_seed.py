@@ -42,15 +42,8 @@ PROFILE = {
     "supplement_gap": "витамин D (зимой мало солнца) — обсудить тест 25-OH-D",
 }
 
-# weekday: 0=Пн .. 6=Вс. Время плавающее -> храним подсказку, не точное время.
-VB_TEMPLATE = [
-    # (weekday, title, kind, duration_min, time_hint, flexible)
-    (1, "Техника (персональная)", "technique", 60, "утро", 1),
-    (2, "Техника с напарником", "technique", 60, "утро", 1),
-    (2, "Игровая, группа", "game", 120, "вечер", 1),
-    (3, "Техника (персональная)", "technique", 60, "утро", 1),
-    (4, "Игровая с тренером", "game", 105, "вечер", 1),
-]
+# Недельный шаблон переехал в content/seasons.py и хранится в БД: сезон должен
+# меняться из Telegram, а не правкой кода с последующим деплоем.
 
 
 def seed_if_empty(db: DB) -> None:
@@ -65,6 +58,13 @@ def seed_if_empty(db: DB) -> None:
         # миграция: добавки без числа приёмов -> обновить на каноничные с doses
         prof["supplements"] = PROFILE["supplements"]
         db.set_profile(prof)
-    db.seed_template(VB_TEMPLATE)
+
+    # Шаблон недели живёт в БД (правится из Telegram), стартовый — пляжный
+    # сезон: он совпадает с тем, что раньше было захардкожено в коде.
+    from ..content.seasons import DEFAULT_SEASON, slots_for
+    db.seed_program(slots_for(DEFAULT_SEASON))
+    if db.get_setting("season") is None:
+        db.set_setting("season", DEFAULT_SEASON)
+
     # Рабочие веса для прогрессии — из профиля (не предельные).
-    db.seed_weights({"squat": 100.0, "trapbar": 120.0})
+    db.seed_weights({"squat": 95.0, "trapbar": 90.0})

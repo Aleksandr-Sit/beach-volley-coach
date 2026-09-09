@@ -9,11 +9,23 @@ import datetime
 
 import pytest
 
+from bot.activity import days_silent, touch
+from bot.content.seasons import SEASONS, slots_for
 from bot.db import DB
 from bot.intent import normalize_time, parse_time_and_duration
 from bot.modules.profile_seed import seed_if_empty
+from bot.modules.program import (
+    add_slot,
+    apply_season,
+    block_index,
+    cycle_badge,
+    is_deload,
+    regenerate_from,
+    remove_slot,
+    set_anchor,
+)
 from bot.modules.schedule_sync import autoregulate_week, generate_week
-from bot.modules.weekly_adapt import has_pain, is_deload_week, run_weekly_adapt
+from bot.modules.weekly_adapt import has_pain, run_weekly_adapt
 from bot.mutations import move_session
 from bot.nutrition.foods import estimate_meal, parse_manual, parse_product
 from bot.nutrition.targets import compute_targets
@@ -317,13 +329,23 @@ class TestBodyWeight:
 
 
 class TestDeload:
-    def test_every_fifth_progression(self, db):
-        assert is_deload_week(db) is False
-        for i in range(4):
-            db.mark_progression_applied(f"2026-0{i + 1}-05")
-        assert is_deload_week(db) is False  # 4 недели работы
-        db.mark_progression_applied("2026-05-05")
-        assert is_deload_week(db) is True   # 5-я — разгрузка
+    """Разгрузка считается по календарю блока, а не по числу записанных недель."""
+
+    def test_fourth_week_of_block(self, db):
+        set_anchor(db, MON)
+        weeks = [MON + datetime.timedelta(days=7 * i) for i in range(5)]
+        assert [is_deload(db, w) for w in weeks] == [False, False, False, True, False]
+
+    def test_does_not_depend_on_logging(self, db):
+        """Регрессия: логируешь через раз — разгрузка не наступала никогда."""
+        set_anchor(db, MON)
+        # ни одной записи в progression_applied, а разгрузка всё равно приходит
+        assert is_deload(db, MON + datetime.timedelta(days=21)) is True
+
+    def test_badge_is_human_readable(self, db):
+        set_anchor(db, MON)
+        assert cycle_badge(db, MON).startswith("Блок 1 · неделя 1")
+        assert "разгрузка" in cycle_badge(db, MON + datetime.timedelta(days=21))
 
     def test_deload_workout_has_no_jumps(self):
         from bot.content.workout import build_workout
@@ -355,3 +377,180 @@ class TestTimeParsing:
     ])
     def test_time_and_duration(self, raw, tm, dur):
         assert parse_time_and_duration(raw) == (tm, dur)
+
+
+# ------------------------------------------------------------- сезоны
+class TestSeasons:
+    """Смена сезона — главная причина, по которой план расходился с жизнью."""
+
+    def test_preset_replaces_template(self, db):
+        generate_week(db, MON)
+        apply_season(db, "offseason", MON)
+        cats = [s["category"] for s in db.get_program()]
+        assert cats.count("gym") == 3   # межсезонье: три силовых
+        assert cats.count("vb") == 2    # волейбола меньше
+        assert len(db.get_program()) == len(slots_for("offseason"))
+
+    def test_every_preset_is_applicable(self, db):
+        """Каждый пресет должен разворачиваться в неделю без исключений."""
+        for key in SEASONS:
+            apply_season(db, key, MON)
+            sessions = db.sessions_between(MON.isoformat(), SUN.isoformat())
+            assert sessions, f"сезон {key} не дал ни одной сессии"
+
+    def test_gym_never_lands_on_volleyball_day(self, db):
+        """Инвариант: зал не ставится в день волейбола (правило коллизии)."""
+        for key in SEASONS:
+            apply_season(db, key, MON)
+            by_day: dict[str, set] = {}
+            for s in db.sessions_between(MON.isoformat(), SUN.isoformat()):
+                by_day.setdefault(s["date"], set()).add(s["category"])
+            for date_iso, cats in by_day.items():
+                assert not ("vb" in cats and "gym" in cats), \
+                    f"{key}: зал и волейбол в один день {date_iso}"
+
+    def test_past_days_survive_season_change(self, db):
+        """Смена сезона посреди недели не переписывает прошедшие дни."""
+        generate_week(db, MON)
+        wed = MON + datetime.timedelta(days=2)
+        before = {s["id"] for s in db.sessions_between(MON.isoformat(),
+                                                       (wed - datetime.timedelta(days=1)).isoformat())}
+        apply_season(db, "indoor", wed)
+        after = {s["id"] for s in db.sessions_between(MON.isoformat(),
+                                                      (wed - datetime.timedelta(days=1)).isoformat())}
+        assert before == after
+
+    def test_logged_workout_is_never_deleted(self, db):
+        """Записанная тренировка переживает любую пересборку — это история."""
+        generate_week(db, MON)
+        s = db.sessions_between(MON.isoformat(), SUN.isoformat())[0]
+        db.add_workout_log(s["id"], s["category"], s["kind"] or "", s["date"],
+                           "присед 100 5×5")
+        apply_season(db, "indoor", MON)
+        assert db.get_session(s["id"]) is not None
+
+    def test_horizon_covers_next_week(self, db):
+        """После смены сезона следующая неделя должна быть видна сразу.
+
+        Регрессия: пересобиралась только текущая неделя, и «неделя вперёд»
+        оставалась пустой до своего наступления — увидеть новую программу
+        целиком было нельзя.
+        """
+        weeks = apply_season(db, "offseason", MON)[1]
+        assert weeks >= 2
+        nxt = MON + datetime.timedelta(days=7)
+        rows = db.sessions_between(nxt.isoformat(),
+                                   (nxt + datetime.timedelta(days=6)).isoformat())
+        assert rows, "следующая неделя пуста"
+        assert {r["category"] for r in rows} == {"gym", "vb", "recovery"}
+
+    def test_anchor_resets_cycle(self, db):
+        """Новый сезон начинает мезоцикл заново, а не продолжает старый."""
+        set_anchor(db, MON - datetime.timedelta(days=70))
+        assert block_index(db, MON) > 0
+        apply_season(db, "beach", MON)
+        assert block_index(db, MON) == 0
+
+
+# --------------------------------------------------- правка одного дня
+class TestProgramEdit:
+    def test_add_and_remove_slot(self, db):
+        # В межсезонье четверг свободен — ставим туда зал.
+        apply_season(db, "offseason", MON)
+        thu = MON + datetime.timedelta(days=3)
+        add_slot(db, 3, "gym", "Зал: верх", "upper", 60, None, "moderate", thu)
+        assert "Зал: верх" in [s["title"] for s in db.sessions_for(thu.isoformat())]
+
+        slot = [s for s in db.get_program() if s["title"] == "Зал: верх"][0]
+        remove_slot(db, slot["id"], thu)
+        assert "Зал: верх" not in [s["title"] for s in db.sessions_for(thu.isoformat())]
+
+    def test_gym_on_volleyball_day_is_dropped(self, db):
+        """Инвариант «зал уступает волейболу» сильнее ручной правки.
+
+        Важно, что это НЕ тихо: handlers/program.py предупреждает заранее,
+        иначе бот отвечал бы «добавил», а в плане ничего не появлялось.
+        """
+        apply_season(db, "beach", MON)   # в пляжном сезоне четверг занят волейболом
+        thu = MON + datetime.timedelta(days=3)
+        add_slot(db, 3, "gym", "Зал: верх", "upper", 60, None, "moderate", thu)
+        cats = {s["category"] for s in db.sessions_for(thu.isoformat())}
+        assert cats == {"vb"}
+
+    def test_manual_session_survives_regeneration(self, db):
+        """Добавленное вручную — не шаблон, пересборка его не трогает."""
+        generate_week(db, MON)
+        thu = (MON + datetime.timedelta(days=3)).isoformat()
+        db.add_session(date=thu, start_time="19:00", category="vb",
+                       title="Игра с друзьями", kind="game", duration_min=90,
+                       load="moderate", status="planned", origin="manual")
+        regenerate_from(db, MON + datetime.timedelta(days=3))
+        assert "Игра с друзьями" in [s["title"] for s in db.sessions_for(thu)]
+
+    def test_edit_marks_season_as_custom(self, db):
+        from bot.modules.program import is_edited
+        apply_season(db, "beach", MON)
+        assert is_edited(db) is False
+        add_slot(db, 3, "recovery", "Мобильность", "mobility", 30, None, "light", MON)
+        assert is_edited(db) is True
+
+
+# ----------------------------------------------------- ротация подсобки
+class TestRotation:
+    def _lower(self, variant):
+        from bot.content.workout import build_workout
+        s = {"category": "gym", "kind": "lower", "load": "heavy",
+             "title": "Зал: ноги", "date": MON.isoformat()}
+        return build_workout(s, weights={"squat": 95, "trapbar": 90},
+                             variant=variant)
+
+    def test_variants_differ(self):
+        """Четыре блока — четыре разные подсобки, иначе смысла в ротации нет."""
+        texts = [self._lower(v) for v in range(4)]
+        assert len(set(texts)) == 4
+
+    def test_variant_cycles(self):
+        assert self._lower(0) == self._lower(4)  # пул из четырёх, идём по кругу
+
+    def test_base_lifts_never_rotate(self):
+        """Присед и трап-гриф остаются: на них висит прогрессия весов."""
+        for v in range(8):
+            text = self._lower(v)
+            assert "Присед со штангой" in text
+            assert "Тяга трап-гриф" in text
+
+    def test_prehab_never_rotates(self):
+        """Плечо — главный лимит: prehab это лечение, а не разнообразие."""
+        from bot.content.workout import build_workout
+        for v in range(8):
+            s = {"category": "gym", "kind": "upper", "load": "heavy",
+                 "title": "Зал: верх", "date": MON.isoformat()}
+            assert "Face pull" in build_workout(s, variant=v)
+
+    def test_swap_bumps_variant(self, db):
+        week = MON.isoformat()
+        assert db.variation_shift(week, "lower") == 0
+        assert db.bump_variation(week, "lower") == 1
+        assert db.variation_shift(week, "lower") == 1
+        assert db.variation_shift(week, "upper") == 0  # сдвиг только своего типа
+
+
+# ------------------------------------------------------------ молчание
+class TestSilence:
+    def test_no_record_is_not_silence(self, db):
+        """Пустая отметка — «ещё не знаем», а не «молчит месяц»."""
+        assert days_silent(db) == 0
+
+    def test_counts_days(self, db):
+        db.set_setting("last_seen",
+                       (datetime.date.today() - datetime.timedelta(days=9)).isoformat())
+        assert days_silent(db) == 9
+
+    def test_touch_resets(self, db):
+        db.set_setting("last_seen", "2026-01-01")
+        touch(db)
+        assert days_silent(db) == 0
+
+    def test_broken_value_does_not_crash(self, db):
+        db.set_setting("last_seen", "не дата")
+        assert days_silent(db) == 0

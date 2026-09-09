@@ -11,15 +11,6 @@ from ..db import DB
 
 WEEKDAY_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
-# Дефолтные слоты зала/восстановления на дни БЕЗ волейбола.
-# Верх — плечо-дружественный (без классического жима штанги), + prehab.
-GYM_DEFAULTS = [
-    # (weekday, category, title, kind, duration_min, load)
-    (0, "gym", "Зал: ноги/мощность", "lower", 60, "heavy"),      # Пн — свежий
-    (5, "gym", "Зал: верх (плечо-safe) + prehab", "upper", 60, "moderate"),  # Сб
-    (6, "recovery", "Мобильность/восстановление", "mobility", 30, "light"),  # Вс
-]
-
 
 def monday_of(d: date) -> date:
     return d - timedelta(days=d.weekday())
@@ -35,47 +26,46 @@ def backfill_generated_weeks(db: DB) -> None:
             continue
 
 
-def generate_week(db: DB, any_day: date) -> None:
-    """Создаёт сессии недели из шаблона волейбола + дефолтный зал.
+def generate_week(db: DB, any_day: date, not_before: date | None = None) -> None:
+    """Создаёт сессии недели из шаблона программы (волейбол + зал + восстановление).
 
     Идемпотентно по реестру generated_weeks. Раньше признаком было «есть хоть одна
     сессия в неделе» — из-за этого перенос сессии на будущую неделю блокировал
     генерацию её плана целиком.
+
+    not_before — не трогать дни раньше этой даты. Нужно при смене программы
+    посреди недели: прошедшие дни остаются как были, новый шаблон применяется
+    с указанного дня.
     """
     monday = monday_of(any_day)
     if db.is_week_generated(monday.isoformat()):
         return
     db.mark_week_generated(monday.isoformat())  # до вставок — защита от гонки
 
-    template = db.get_template()
-    vb_days = set()
-    for t in template:
-        d = (monday + timedelta(days=int(t["weekday"]))).isoformat()
-        vb_days.add(int(t["weekday"]))
-        load = "heavy" if t["kind"] == "game" else "moderate"
+    slots = db.get_program()
+    vb_days = {int(s["weekday"]) for s in slots if s["category"] == "vb"}
+
+    for s in slots:
+        weekday = int(s["weekday"])
+        # Правило коллизии: зал/восстановление не ставим в день волейбола.
+        if s["category"] != "vb" and weekday in vb_days:
+            continue
+        d = monday + timedelta(days=weekday)
+        if not_before and d < not_before:
+            continue
+        load = s["load"] or ("heavy" if s["kind"] == "game" else "moderate")
         db.add_session(
-            date=d,
+            date=d.isoformat(),
             start_time=None,  # плавающее время, уточняется
-            category="vb",
-            title=t["title"],
-            kind=t["kind"],
-            duration_min=t["duration_min"],
+            category=s["category"],
+            title=s["title"],
+            kind=s["kind"],
+            duration_min=s["duration_min"],
             load=load,
             base_load=load,
-            time_hint=t["time_hint"],
+            time_hint=s["time_hint"],
             status="planned",
             origin="template",
-        )
-
-    # Зал/восстановление — только на дни без волейбола (правило коллизии).
-    for weekday, category, title, kind, dur, load in GYM_DEFAULTS:
-        if weekday in vb_days:
-            continue
-        d = (monday + timedelta(days=weekday)).isoformat()
-        db.add_session(
-            date=d, start_time=None, category=category, title=title,
-            kind=kind, duration_min=dur, load=load, base_load=load,
-            status="planned", origin="template",
         )
 
     autoregulate_week(db, monday)

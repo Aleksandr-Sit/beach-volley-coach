@@ -81,6 +81,24 @@ def add_session(db: DB, target_date: str, title: str, category: str = "vb",
     return f"➕ Добавил: {title} → {WEEKDAY_RU[d.weekday()]}.", _recompute(db, target_date)
 
 
+def change_type(db: DB, sid: int, category: str, kind: str, title: str,
+                duration: int, load: str) -> tuple[str, list[str]]:
+    """Меняет тип ОДНОЙ тренировки (сегодня хочу верх вместо ног).
+
+    Шаблон недели не трогает: разовая замена и смена программы — разные вещи,
+    и путать их нельзя. base_load тоже обновляем, иначе автопрегуляция будет
+    возвращать нагрузку от старого типа.
+    """
+    s = db.get_session(sid)
+    if not s:
+        return "Сессия не найдена.", []
+    db.update_session(sid, category=category, kind=kind, title=title,
+                      duration_min=duration, load=load, base_load=load)
+    db.log_event("session_retyped", {"sid": sid, "date": s["date"],
+                                     "from": s["title"], "to": title})
+    return f"🔁 Заменил: {s['title']} → <b>{title}</b>.", _recompute(db, s["date"])
+
+
 def restore_session(db: DB, sid: int) -> tuple[str, list[str]]:
     s = db.get_session(sid)
     if not s:

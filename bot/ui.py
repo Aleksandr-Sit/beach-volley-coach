@@ -257,6 +257,7 @@ def session_menu_kb(sid: int) -> InlineKeyboardMarkup:
     kb.button(text="🌧 Отменить", callback_data=Cb(a="cancel", sid=sid))
     kb.button(text="🕐 Время / длительность", callback_data=Cb(a="retime", sid=sid))
     kb.button(text="📅 Перенести на день", callback_data=Cb(a="moveday", sid=sid))
+    kb.button(text="🔁 Сменить тип тренировки", callback_data=Cb(a="stype", sid=sid))
     kb.adjust(1)
     return kb.as_markup()
 
@@ -290,4 +291,159 @@ def confirm_kb() -> InlineKeyboardMarkup:
     kb.button(text="✅ Применить", callback_data=Cb(a="apply"))
     kb.button(text="✖️ Отмена", callback_data=Cb(a="drop"))
     kb.adjust(2)
+    return kb.as_markup()
+
+
+# ==================== программа недели и сезоны ====================
+
+# Что можно поставить в шаблон недели.
+# key -> (подпись, category, kind, title, duration_min, load)
+PROGRAM_TYPES = {
+    "vbt": ("🏐 Волейбол: техника", "vb", "technique", "Техника", 60, "moderate"),
+    "vbg": ("🏐 Волейбол: игровая", "vb", "game", "Игровая", 120, "heavy"),
+    "low": ("🏋️ Зал: ноги", "gym", "lower", "Зал: ноги/мощность", 60, "heavy"),
+    "upp": ("🏋️ Зал: верх (плечо-safe)", "gym", "upper",
+            "Зал: верх (плечо-safe) + prehab", 60, "moderate"),
+    "rec": ("🧘 Восстановление / мобильность", "recovery", "mobility",
+            "Мобильность/восстановление", 30, "light"),
+}
+
+# Коды подсказки времени в callback — только ASCII, кириллица раздувает лимит 64 байта.
+HINT_CODES = {"m": "утро", "e": "вечер", "q": None}
+HINT_LABEL = {"m": "🌅 Утром", "e": "🌆 Вечером", "q": "🕐 Уточню потом"}
+
+
+def _hint_text(hint: str | None) -> str:
+    if not hint:
+        return "время уточнить"
+    if "утро" in hint:
+        return "утром"
+    if "вечер" in hint:
+        return "вечером"
+    return hint
+
+
+def render_program(season_line: str, period: str, cycle: str, slots: list) -> str:
+    """Экран «Программа недели»: что стоит в шаблоне на каждый день."""
+    lines = ["🗓 <b>Программа недели</b>", f"{season_line} · <i>{escape(period)}</i>",
+             f"<i>🔄 {escape(cycle)}</i>", DIVIDER, ""]
+    by_day: dict[int, list] = {}
+    for s in slots:
+        by_day.setdefault(int(s["weekday"]), []).append(s)
+    for wd in range(7):
+        day = by_day.get(wd)
+        if not day:
+            lines.append(f"<b>{WEEKDAY_FULL[wd]}</b> — <i>свободно</i>")
+            continue
+        lines.append(f"<b>{WEEKDAY_FULL[wd]}</b>")
+        for s in day:
+            icon = CAT_ICON.get(s["category"], "•")
+            lines.append(f"   {icon} {escape(s['title'])} · "
+                         f"<i>{_hint_text(s['time_hint'])} · {s['duration_min']} мин</i>")
+    lines.append("")
+    lines.append(DIVIDER)
+    lines.append("<i>Это шаблон, из которого собирается каждая неделя. Правки "
+                 "применяются к будущим дням — прошлое и уже записанные "
+                 "тренировки не трогаются.</i>")
+    return "\n".join(lines)
+
+
+def program_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 Сменить сезон", callback_data=Cb(a="season"))
+    kb.button(text="✏️ Изменить день", callback_data=Cb(a="pday"))
+    kb.button(text="♻️ Пересобрать план", callback_data=Cb(a="regen"))
+    kb.button(text="◀️ План на сегодня", callback_data=Cb(a="today_btn"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def season_kb(seasons: dict, current: str, suggested: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for key, s in seasons.items():
+        mark = " ✓" if key == current else (" 💡" if key == suggested else "")
+        kb.button(text=f"{s['label']}{mark}", callback_data=Cb(a="seasonpick", v=key))
+    kb.button(text="◀️ Назад", callback_data=Cb(a="prog"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def season_scope_kb(key: str) -> InlineKeyboardMarkup:
+    """С какого момента применить новый сезон."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📍 С завтрашнего дня", callback_data=Cb(a="seasonset", v=f"{key}|t"))
+    kb.button(text="📅 Со следующего понедельника",
+              callback_data=Cb(a="seasonset", v=f"{key}|w"))
+    kb.button(text="✖️ Не менять", callback_data=Cb(a="prog"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def program_weekday_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for i, name in enumerate(WEEKDAY_RU):
+        kb.button(text=name, callback_data=Cb(a="pdayedit", v=str(i)))
+    kb.button(text="◀️ Назад", callback_data=Cb(a="prog"))
+    kb.adjust(4, 3, 1)
+    return kb.as_markup()
+
+
+def program_day_kb(weekday: int, slots: list) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for s in slots:
+        kb.button(text=f"🗑 Убрать: {s['title']}",
+                  callback_data=Cb(a="pdel", sid=s["id"]))
+    kb.button(text="➕ Добавить в этот день",
+              callback_data=Cb(a="padd", v=str(weekday)))
+    kb.button(text="◀️ К программе", callback_data=Cb(a="prog"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def program_type_kb(weekday: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for key, (label, *_rest) in PROGRAM_TYPES.items():
+        kb.button(text=label, callback_data=Cb(a="paddtype", v=f"{weekday}|{key}"))
+    kb.button(text="◀️ Назад", callback_data=Cb(a="pdayedit", v=str(weekday)))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def program_hint_kb(weekday: int, type_key: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for code, label in HINT_LABEL.items():
+        kb.button(text=label,
+                  callback_data=Cb(a="paddhint", v=f"{weekday}|{type_key}|{code}"))
+    kb.button(text="◀️ Назад", callback_data=Cb(a="padd", v=str(weekday)))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def regen_scope_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📍 С завтрашнего дня", callback_data=Cb(a="regenset", v="t"))
+    kb.button(text="📅 Со следующего понедельника", callback_data=Cb(a="regenset", v="w"))
+    kb.button(text="✖️ Отмена", callback_data=Cb(a="prog"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def workout_kb(sid: int, can_swap: bool) -> InlineKeyboardMarkup:
+    """Клавиатура под конкретной тренировкой."""
+    kb = InlineKeyboardBuilder()
+    if can_swap:
+        kb.button(text="🔁 Другой вариант", callback_data=Cb(a="swap", sid=sid))
+    kb.button(text="📝 Записать результат", callback_data=Cb(a="log", sid=sid))
+    kb.button(text="◀️ План на сегодня", callback_data=Cb(a="today_btn"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def session_type_kb(sid: int) -> InlineKeyboardMarkup:
+    """Сменить тип одной сессии (сегодня хочу верх вместо ног)."""
+    kb = InlineKeyboardBuilder()
+    for key, (label, *_rest) in PROGRAM_TYPES.items():
+        kb.button(text=label, callback_data=Cb(a="stypeset", sid=sid, v=key))
+    kb.button(text="◀️ Назад", callback_data=Cb(a="menu", sid=sid))
+    kb.adjust(1)
     return kb.as_markup()

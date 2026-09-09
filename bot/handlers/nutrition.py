@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from html import escape
 
@@ -104,7 +105,8 @@ async def got_food(msg: Message, state: FSMContext, db: DB, llm: LLMClient) -> N
         p += manual_p
     # Ничего не распознали и чисел нет → оценка через ИИ.
     if manual_k is None and not matched:
-        est = estimate_food(llm, text)
+        # to_thread: синхронный клиент LLM иначе блокирует весь бот на время ответа.
+        est = await asyncio.to_thread(estimate_food, llm, text)
         k, p = est["kcal"], est["protein"]
         src = "llm" if (k or p) else None
 

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from html import escape
 
+from . import pools
+
 _LOAD_BADGE = {"heavy": "🔴 тяжёлая", "moderate": "🟡 средняя", "light": "🟢 лёгкая"}
 _CAT_ICON = {"gym": "🏋️", "recovery": "🧘", "vb": "🏐"}
 _DIVIDER = "➖➖➖➖➖➖➖➖➖➖"
@@ -40,25 +42,21 @@ def _lower(load: str, weights: dict, var: int) -> list[tuple[str, list[str]]]:
     tb = f"{weights.get('trapbar', 90):g}"
     blocks = []
     if heavy:
-        blocks.append(("Прыжковый блок (низкий объём, техника приземления)", [
-            "Выпрыгивания с места — 3×5 (мягкое приземление, беречь голеностоп)",
-            "Дроп-приземления с короба — 3×3 (тихо, колени наружу)",
-        ]))
-    # Вариативность подсобки по чётности недели.
-    if var == 0:
-        uni = f"Болгарский сплит-присед — {'3×8' if heavy else '2×8'}/нога (акцент на VMO)"
-        post = f"Румынская тяга — {'3×8' if heavy else '2×10'}"
-    else:
-        uni = f"Выпады с гантелями — {'3×10' if heavy else '2×10'}/нога (колено не заваливать)"
-        post = f"Ягодичный мост со штангой — {'3×10' if heavy else '2×12'}"
+        jumps = pools.pick(pools.JUMP, var)
+        blocks.append(("Прыжковый блок (низкий объём, техника приземления)",
+                       [pools.line(j, heavy) for j in jumps]))
+    # Базовые движения НЕ ротируем: на них висит прогрессия рабочих весов.
     blocks += [
         ("Сила ног", [
             f"Присед со штангой — {'5×5' if heavy else '4×5'} @RPE7 (не до отказа, рабочий ~{sq} кг)",
             f"Тяга трап-гриф — {'3×6' if heavy else '3×5'} (рабочий ~{tb} кг, спина нейтральна)",
         ]),
-        ("Односторонняя + задняя цепь", [uni, post]),
+        ("Односторонняя + задняя цепь", [
+            pools.line(pools.pick(pools.UNILATERAL, var), heavy),
+            pools.line(pools.pick(pools.POSTERIOR, var), heavy),
+        ]),
         ("Голеностоп + кор", ANKLE_PREHAB + [
-            f"Планка / паллоф-антиротация — {'3' if heavy else '2'}×30–45с (защита поясницы)",
+            pools.line(pools.pick(pools.LOWER_CORE, var), heavy),
         ]),
     ]
     return blocks
@@ -70,27 +68,19 @@ def _upper(load: str, var: int) -> list[tuple[str, list[str]]]:
             "Только prehab плеча + лёгкие тяги.",
         ] + SHOULDER_PREHAB)]
     full = load == "heavy"
-    press = ("Ландмайн-жим (нейтральный хват)" if var == 0
-             else "Жим гантелей нейтральным хватом сидя")
-    if var == 0:
-        row = "Тяга гантели в наклоне"
-        row_reps = f"{'3×10' if full else '2×10'}/рука"  # гантель — по одной руке
-    else:
-        row = "Тяга штанги в наклоне (нейтральный хват)"
-        row_reps = f"{'3×10' if full else '2×10'}"        # штанга — двумя руками
     return [
         ("Разогрев плеча (обязательно)", SHOULDER_PREHAB),
         ("Жим — только плечо-safe (без штанги над головой)", [
-            f"{press} — {'3×8' if full else '2×10'} (без боли!)",
+            pools.line(pools.pick(pools.PRESS, var), full),
             "Отжимания на кольцах/от пола нейтрально — 2×макс комфортно",
         ]),
         ("Тяги (приоритет — их больше, чем жимов)", [
-            f"{row} — {row_reps}",
-            f"Тяга верхнего блока / подтягивания — {'3×8' if full else '2×8'}",
+            pools.line(pools.pick(pools.ROW, var), full),
+            pools.line(pools.pick(pools.VERTICAL, var), full),
         ]),
         ("Плечи здоровые + кор", [
-            "Наружная ротация на блоке — 3×15",
-            f"Антиэкстензия кор (ролик/планка) — {'3' if full else '2'}×30с",
+            pools.line(pools.pick(pools.SHOULDER_EXTRA, var), full),
+            pools.line(pools.pick(pools.UPPER_CORE, var), full),
         ]),
     ]
 
@@ -134,14 +124,6 @@ def _volleyball(kind: str) -> list[tuple[str, list[str]]]:
     return blocks
 
 
-def _week_var(date_iso: str) -> int:
-    try:
-        import datetime
-        return datetime.date.fromisoformat(date_iso).isocalendar()[1] % 2
-    except Exception:
-        return 0
-
-
 def _deload_blocks(load: str, weights: dict) -> list[tuple[str, list[str]]]:
     """Разгрузочная неделя: объём вниз, веса те же, без прыжкового блока."""
     sq = f"{weights.get('squat', 95):g}"
@@ -158,15 +140,20 @@ def _deload_blocks(load: str, weights: dict) -> list[tuple[str, list[str]]]:
 
 
 def build_workout(session, last_log=None, weights: dict | None = None,
-                  deload: bool = False) -> str:
-    """Рендерит конкретную тренировку. last_log — прошлый результат для ориентира,
-    weights — текущие рабочие веса (прогрессия)."""
+                  deload: bool = False, variant: int = 0,
+                  badge: str | None = None) -> str:
+    """Рендерит конкретную тренировку.
+
+    last_log — прошлый результат для ориентира; weights — рабочие веса;
+    variant — номер варианта подсобки (блок мезоцикла + ручной сдвиг), см.
+    content/pools.py; badge — «Блок 2 · неделя 3 из 4» для наглядности ротации.
+    """
     category = session["category"]
     kind = session["kind"] or ""
     load = session["load"] or "moderate"
     title = session["title"]
     weights = weights or {"squat": 95, "trapbar": 90}
-    var = _week_var(session["date"])
+    var = variant
 
     if category == "gym" and deload:
         blocks = _deload_blocks(load, weights)
@@ -185,6 +172,8 @@ def build_workout(session, last_log=None, weights: dict | None = None,
     lines = [f"{icon} <b>{escape(title)}</b>"]
     if category == "gym" and load in _LOAD_BADGE:
         lines.append(f"{_LOAD_BADGE[load]} нагрузка")
+    if badge and category in ("gym", "recovery"):
+        lines.append(f"<i>🔄 {escape(badge)}</i>")
     lines.append("")
     if last_log:
         lines.append(f"📈 <b>Последняя запись</b> · {last_log['date']}")
@@ -199,6 +188,8 @@ def build_workout(session, last_log=None, weights: dict | None = None,
     tips = []
     if category == "gym":
         tips.append("RPE7 = усилие ~7/10 (2–3 повтора в запасе, не до отказа).")
+        tips.append("Надоело упражнение — «🔁 Другой вариант» сменит подсобку "
+                    "на эту неделю.")
     tips.append("Незнакомое упражнение — напиши его название, дам разбор и видео.")
     if category in ("gym", "vb"):
         tips.append("📝 Записать веса/повторы — кнопка в меню сессии.")

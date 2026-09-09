@@ -35,18 +35,18 @@ def has_pain(text: str) -> bool:
     return bool(_PAIN_RE.search(text or ""))
 
 
-DELOAD_EVERY = 5  # каждая 5-я неделя прогрессии — разгрузочная
+def is_deload_week(db: DB, ref_date: date | None = None) -> bool:
+    """Пора ли разгружаться: последняя неделя каждого 4-недельного блока.
 
-
-def is_deload_week(db: DB) -> bool:
-    """Пора ли разгружаться: каждые DELOAD_EVERY применённых недель прогрессии.
-
-    Для 40+ и submaximal-режима разгрузка раз в ~5 недель снижает риск травмы
-    и позволяет весам расти дальше.
+    Раньше считалось по числу ПРИМЕНЁННЫХ прогрессий, то есть по числу недель,
+    в которые атлет записывал результаты. Логируешь через раз — разгрузка не
+    наступает никогда, хотя усталость копится по календарю, а не по логам.
+    Теперь блок ведётся от даты старта программы (см. modules/program.py).
     """
-    applied = db.conn.execute(
-        "SELECT COUNT(*) c FROM progression_applied").fetchone()["c"]
-    return applied > 0 and applied % DELOAD_EVERY == 0
+    from ..clock import today
+    from .program import is_deload
+
+    return is_deload(db, ref_date or today())
 
 
 def _fmt_weights(weights: dict) -> str:
@@ -147,12 +147,21 @@ def run_weekly_adapt(db: DB, ref_date: date) -> str:
             t_s = f" · {arrow} {trend:+g} кг за месяц"
         lines.insert(4, f"⚖️ Вес · <b>{w[1]:g} кг</b>{t_s}")
 
-    if is_deload_week(db):
-        lines.append("🪫 <b>Разгрузочная неделя</b>")
-        lines.append("   <i>Работал 4 недели подряд — снижаю объём: подходов "
-                     "меньше, веса те же, прыжковый блок убираю. Это часть плана, "
-                     "а не откат.</i>")
-        lines.append("")
+    # Что будет на СЛЕДУЮЩЕЙ неделе: разгрузка и/или смена блока подсобки.
+    # Разбор приходит в воскресенье, поэтому смотреть надо вперёд, а не назад.
+    from .program import block_index, cycle_badge, is_deload
+
+    nxt = mon + timedelta(days=7)
+    lines.append("🔄 <b>Цикл</b>")
+    lines.append(f"   <i>Следующая неделя — {cycle_badge(db, nxt)}.</i>")
+    if is_deload(db, nxt):
+        lines.append("   🪫 <b>Разгрузка:</b> подходов меньше, веса те же, "
+                     "прыжковый блок убираю. Это часть плана, а не откат.")
+    elif block_index(db, nxt) != block_index(db, mon):
+        lines.append("   🆕 <b>Новый блок:</b> меняю подсобку — односторонние, "
+                     "заднюю цепь и кор. База (присед, трап-гриф) остаётся, "
+                     "иначе прогрессию не с чем сравнивать.")
+    lines.append("")
 
     lines.append("💡 <b>Рекомендации</b>")
     lines.append("   • Плечо (главный лимит): ротаторы и face pull — каждую неделю.")
@@ -166,5 +175,6 @@ def run_weekly_adapt(db: DB, ref_date: date) -> str:
     if vb_cancel and vb_done <= 2:
         lines.append("   • Волейбола мало — если погода мешает, добавь зал/технику дома.")
     lines.append("")
-    lines.append("<i>В зале на след. неделю сменю часть подсобки — чтобы не застаиваться.</i>")
+    lines.append("<i>Программа не та? «/program» — сменить сезон или поправить "
+                 "любой день недели.</i>")
     return "\n".join(lines)

@@ -35,7 +35,9 @@ def load_config() -> Config:
         chat_id=_get("TELEGRAM_CHAT_ID", default=""),
         gemini_api_key=_get("GEMINI_API_KEY", default=""),
         llm_provider=_get("LLM_PROVIDER", default="gemini"),
-        llm_model=_get("LLM_MODEL", default="gemini-2.0-flash"),
+        # gemini-2.0-flash снята Google 2026 — бот молча замолчал на полтора
+        # месяца. Клиент умеет падать на запасную модель, но пин держим свежим.
+        llm_model=_get("LLM_MODEL", default="gemini-3.6-flash"),
         timezone=_get("TIMEZONE", default="Europe/Samara"),
         push_hour=int(_get("MORNING_PUSH_HOUR", default="8")),
         push_minute=int(_get("MORNING_PUSH_MINUTE", default="0")),

@@ -17,14 +17,34 @@ CREATE TABLE IF NOT EXISTS profile (
     data    TEXT NOT NULL            -- JSON: рост/вес/цели/формат/травмы и т.д.
 );
 
-CREATE TABLE IF NOT EXISTS vb_template (
+-- Шаблон недели: и волейбол, и зал, и восстановление в ОДНОЙ таблице.
+-- Раньше волейбол жил в vb_template, а зал был захардкожен в schedule_sync.py —
+-- из-за этого смена сезона требовала правки кода и деплоя, и к концу пляжного
+-- сезона план расходился с жизнью.
+CREATE TABLE IF NOT EXISTS program_template (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     weekday      INTEGER NOT NULL,    -- 0=Пн .. 6=Вс
+    category     TEXT NOT NULL,       -- vb | gym | recovery
     title        TEXT NOT NULL,
-    kind         TEXT NOT NULL,       -- technique | game | personal
+    kind         TEXT NOT NULL,       -- technique | game | lower | upper | mobility
     duration_min INTEGER NOT NULL,
     time_hint    TEXT,                -- 'утро' | 'вечер' | 'HH:MM'
+    load         TEXT NOT NULL DEFAULT 'moderate',
     flexible     INTEGER NOT NULL DEFAULT 1
+);
+
+-- Настройки, правимые из Telegram (текущий сезон, якорь блока, last_seen).
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- Сдвиг вариативности подсобки: кнопка «другой вариант» на экране тренировки.
+CREATE TABLE IF NOT EXISTS variation_offset (
+    week_start TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    shift      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (week_start, kind)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -60,23 +80,9 @@ CREATE TABLE IF NOT EXISTS events (
     payload    TEXT                  -- JSON план vs факт
 );
 
-CREATE TABLE IF NOT EXISTS nutrition_log (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    date      TEXT NOT NULL,
-    meal      TEXT,
-    text      TEXT,
-    photo_path TEXT,
-    protein_g REAL,
-    kcal      REAL
-);
-
-CREATE TABLE IF NOT EXISTS supplements (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    name    TEXT NOT NULL,
-    dose    TEXT,
-    timing  TEXT,
-    active  INTEGER NOT NULL DEFAULT 1
-);
+-- nutrition_log и supplements удалены миграцией v5: обе таблицы за всё время
+-- существования проекта не получили ни одной строки. Реально работают food_log
+-- и supplement_log; добавки хранятся в JSON профиля.
 
 CREATE TABLE IF NOT EXISTS workout_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,7 +186,65 @@ def _migrate_3(conn: sqlite3.Connection) -> None:
         )""")
 
 
-MIGRATIONS = [_migrate_1, _migrate_2, _migrate_3]
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+# Зал/восстановление, которые раньше были константой GYM_DEFAULTS в коде.
+# Переезжают в БД, чтобы сезон менялся из Telegram, а не деплоем.
+_LEGACY_GYM = [
+    (0, "gym", "Зал: ноги/мощность", "lower", 60, None, "heavy"),
+    (5, "gym", "Зал: верх (плечо-safe) + prehab", "upper", 60, None, "moderate"),
+    (6, "recovery", "Мобильность/восстановление", "mobility", 30, None, "light"),
+]
+
+
+def _migrate_4(conn: sqlite3.Connection) -> None:
+    """v4: единый program_template вместо vb_template + захардкоженного зала.
+
+    Смена сезона правкой кода — главная причина, по которой план расходился с
+    жизнью: кончился пляжный сезон, а поправить неделю можно было только
+    деплоем. Переносим шаблон в БД без потери существующих строк.
+    """
+    if not _table_exists(conn, "vb_template"):
+        return  # свежая база: program_template уже создан схемой, сидит profile_seed
+    have = conn.execute("SELECT COUNT(*) c FROM program_template").fetchone()["c"]
+    if not have:
+        rows = conn.execute("SELECT * FROM vb_template ORDER BY weekday, id").fetchall()
+        for r in rows:
+            load = "heavy" if r["kind"] == "game" else "moderate"
+            conn.execute(
+                "INSERT INTO program_template(weekday, category, title, kind, "
+                "duration_min, time_hint, load, flexible) VALUES(?,'vb',?,?,?,?,?,?)",
+                (r["weekday"], r["title"], r["kind"], r["duration_min"],
+                 r["time_hint"], load, r["flexible"]),
+            )
+        for wd, cat, title, kind, dur, hint, load in _LEGACY_GYM:
+            conn.execute(
+                "INSERT INTO program_template(weekday, category, title, kind, "
+                "duration_min, time_hint, load, flexible) VALUES(?,?,?,?,?,?,?,1)",
+                (wd, cat, title, kind, dur, hint, load),
+            )
+    conn.execute("DROP TABLE vb_template")
+
+
+def _migrate_5(conn: sqlite3.Connection) -> None:
+    """v5: убираем мёртвые таблицы — ни одной строки за всё время проекта.
+
+    Реально пишутся food_log и supplement_log; добавки лежат в JSON профиля.
+    Пустые двойники только путали при ревизии схемы.
+    """
+    for dead in ("nutrition_log", "supplements"):
+        if _table_exists(conn, dead):
+            n = conn.execute(f"SELECT COUNT(*) c FROM {dead}").fetchone()["c"]
+            if n == 0:  # страховка: непустую таблицу не трогаем
+                conn.execute(f"DROP TABLE {dead}")
+
+
+MIGRATIONS = [_migrate_1, _migrate_2, _migrate_3, _migrate_4, _migrate_5]
 
 
 class DB:
@@ -217,22 +281,65 @@ class DB:
         )
         self.conn.commit()
 
-    # ---- vb_template ---------------------------------------------------
-    def get_template(self) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM vb_template ORDER BY weekday, time_hint"
-        ).fetchall()
+    # ---- settings (правятся из Telegram) --------------------------------
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
 
-    def seed_template(self, rows: Iterable[tuple]) -> None:
-        cur = self.conn.execute("SELECT COUNT(*) c FROM vb_template").fetchone()
-        if cur["c"]:
-            return
-        self.conn.executemany(
-            "INSERT INTO vb_template(weekday, title, kind, duration_min, time_hint, flexible) "
-            "VALUES(?,?,?,?,?,?)",
-            rows,
-        )
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
         self.conn.commit()
+
+    # ---- program_template (шаблон недели) -------------------------------
+    def get_program(self, category: str | None = None) -> list[sqlite3.Row]:
+        # Порядок внутри дня: утро → точное время → вечер → «уточню».
+        order = ("ORDER BY weekday, CASE "
+                 "WHEN time_hint LIKE '%утро%' THEN 0 "
+                 "WHEN time_hint LIKE '%вечер%' THEN 2 "
+                 "WHEN time_hint IS NULL THEN 3 ELSE 1 END, time_hint, id")
+        q = "SELECT * FROM program_template"
+        args: tuple = ()
+        if category:
+            q += " WHERE category=?"
+            args = (category,)
+        return self.conn.execute(f"{q} {order}", args).fetchall()
+
+    def get_program_slot(self, slot_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM program_template WHERE id=?", (slot_id,)).fetchone()
+
+    def add_program_slot(self, weekday: int, category: str, title: str, kind: str,
+                         duration_min: int, time_hint: str | None = None,
+                         load: str = "moderate") -> int:
+        cur = self.conn.execute(
+            "INSERT INTO program_template(weekday, category, title, kind, "
+            "duration_min, time_hint, load) VALUES(?,?,?,?,?,?,?)",
+            (weekday, category, title, kind, duration_min, time_hint, load))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def delete_program_slot(self, slot_id: int) -> bool:
+        cur = self.conn.execute("DELETE FROM program_template WHERE id=?", (slot_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def replace_program(self, rows: Iterable[tuple]) -> None:
+        """Полная замена шаблона (смена сезона). rows как в add_program_slot."""
+        self.conn.execute("DELETE FROM program_template")
+        self.conn.executemany(
+            "INSERT INTO program_template(weekday, category, title, kind, "
+            "duration_min, time_hint, load) VALUES(?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+
+    def seed_program(self, rows: Iterable[tuple]) -> None:
+        """Первичный сид — только если шаблон пуст (идемпотентно)."""
+        if self.conn.execute(
+                "SELECT COUNT(*) c FROM program_template").fetchone()["c"]:
+            return
+        self.replace_program(rows)
 
     # ---- sessions ------------------------------------------------------
     def sessions_for(self, date: str) -> list[sqlite3.Row]:
@@ -368,6 +475,48 @@ class DB:
             "VALUES(?,?)", (week_start, _now()),
         )
         self.conn.commit()
+
+    def unmark_week_generated(self, week_start: str) -> None:
+        self.conn.execute(
+            "DELETE FROM generated_weeks WHERE week_start=?", (week_start,))
+        self.conn.commit()
+
+    def generated_weeks_from(self, week_start: str) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT week_start FROM generated_weeks WHERE week_start>=? "
+            "ORDER BY week_start", (week_start,)).fetchall()
+        return [r["week_start"] for r in rows]
+
+    def delete_template_sessions_from(self, from_date: str) -> int:
+        """Сносит будущие сессии ИЗ ШАБЛОНА перед пересборкой программы.
+
+        Не трогает: добавленные вручную (origin='manual'), уже подтверждённые и
+        выполненные, и всё, к чему привязан лог тренировки. Иначе смена сезона
+        стирала бы историю.
+        """
+        cur = self.conn.execute(
+            "DELETE FROM sessions WHERE origin='template' AND date>=? "
+            "AND status IN ('planned','cancelled') "
+            "AND id NOT IN (SELECT COALESCE(session_id,-1) FROM workout_log)",
+            (from_date,))
+        self.conn.commit()
+        return cur.rowcount
+
+    # ---- variation_offset (кнопка «другой вариант подсобки») ------------
+    def variation_shift(self, week_start: str, kind: str) -> int:
+        row = self.conn.execute(
+            "SELECT shift FROM variation_offset WHERE week_start=? AND kind=?",
+            (week_start, kind)).fetchone()
+        return int(row["shift"]) if row else 0
+
+    def bump_variation(self, week_start: str, kind: str) -> int:
+        new = self.variation_shift(week_start, kind) + 1
+        self.conn.execute(
+            "INSERT INTO variation_offset(week_start, kind, shift) VALUES(?,?,?) "
+            "ON CONFLICT(week_start, kind) DO UPDATE SET shift=excluded.shift",
+            (week_start, kind, new))
+        self.conn.commit()
+        return new
 
     def template_session_dates(self) -> list[str]:
         """Даты сессий из шаблона — для разовой backfill-миграции generated_weeks."""
