@@ -29,3 +29,7 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# Корень проекта в sys.path: без этого голый `pytest` (как в CI) не видит
+# пакет `bot` и падает на сборке с кодом 2. `python -m pytest` работал
+# случайно — он сам кладёт cwd в sys.path.
+pythonpath = ["."]

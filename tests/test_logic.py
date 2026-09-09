@@ -10,6 +10,7 @@ import datetime
 import pytest
 
 from bot.activity import days_silent, touch
+from bot.clock import today as coach_today
 from bot.content.seasons import SEASONS, slots_for
 from bot.db import DB
 from bot.intent import normalize_time, parse_time_and_duration
@@ -319,12 +320,12 @@ class TestBodyWeight:
 
     def test_trend(self, db):
         for i, kg in enumerate([90.0, 90.0, 91.0, 91.0, 92.0, 92.0]):
-            d = (datetime.date.today() - datetime.timedelta(days=25 - i * 4)).isoformat()
+            d = (coach_today() - datetime.timedelta(days=25 - i * 4)).isoformat()
             db.add_weight(d, kg)
         assert db.weight_trend() > 0  # растём
 
     def test_trend_needs_two_points(self, db):
-        db.add_weight(datetime.date.today().isoformat(), 91.0)
+        db.add_weight(coach_today().isoformat(), 91.0)
         assert db.weight_trend() is None
 
 
@@ -543,7 +544,7 @@ class TestSilence:
 
     def test_counts_days(self, db):
         db.set_setting("last_seen",
-                       (datetime.date.today() - datetime.timedelta(days=9)).isoformat())
+                       (coach_today() - datetime.timedelta(days=9)).isoformat())
         assert days_silent(db) == 9
 
     def test_touch_resets(self, db):
